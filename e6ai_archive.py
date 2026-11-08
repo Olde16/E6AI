@@ -21,6 +21,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -547,6 +548,31 @@ def not_verified_path(image_dir: Path, post_id: int, extension: str) -> Path:
     return image_dir / "not_verified" / f"{post_id}.{extension}"
 
 
+def move_file_no_overwrite(source: Path, destination: Path) -> None:
+    """Move/link a file without replacing an existing destination."""
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        fallback_errors = {errno.EXDEV, errno.EPERM, errno.EACCES}
+        if hasattr(errno, "ENOTSUP"):
+            fallback_errors.add(errno.ENOTSUP)
+        if hasattr(errno, "EOPNOTSUPP"):
+            fallback_errors.add(errno.EOPNOTSUPP)
+        if exc.errno not in fallback_errors:
+            raise
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(destination, flags, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as target, source.open("rb") as origin:
+                shutil.copyfileobj(origin, target, length=CHUNK_SIZE)
+                target.flush()
+                os.fsync(target.fileno())
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+    source.unlink()
+
+
 def mark_download_error(conn: sqlite3.Connection, post_id: int, message: str) -> None:
     with conn:
         conn.execute(
@@ -597,8 +623,7 @@ def download_one(
             # fetch a fresh copy. Both operations are no-overwrite hard-link moves.
             try:
                 unverified_destination.parent.mkdir(parents=True, exist_ok=True)
-                os.link(destination, unverified_destination)
-                destination.unlink()
+                move_file_no_overwrite(destination, unverified_destination)
                 with conn:
                     conn.execute(
                         "UPDATE posts SET verification_status='not_verified', local_path=? WHERE id=?",
@@ -639,7 +664,7 @@ def download_one(
                 reason = f"MD5-Prüfung fehlgeschlagen (erwartet {expected}, erhalten {actual}); Datei separat unter not_verified gespeichert."
 
         # Atomic no-overwrite placement; hard-link fails if the destination already exists.
-        os.link(temp_path, destination)
+        move_file_no_overwrite(temp_path, destination)
         temp_path.unlink(missing_ok=True)
         with conn:
             conn.execute(
