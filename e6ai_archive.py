@@ -760,8 +760,9 @@ def download_one(
     destination = (verified_dir / f"{post_id}.{ext}") if is_expected_md5 else unverified_destination
     destination_dir.mkdir(parents=True, exist_ok=True)
 
-    # Existing target files are never overwritten. A verified file is reused;
-    # an invalid one is preserved under a unique name before trying a fresh download.
+    # Reuse a correct existing file. If it is corrupt, leave it in place
+    # while downloading a replacement; only move it aside if that attempt fails.
+    existing_corrupt = False
     if destination.exists():
         if is_expected_md5 and verify_md5(destination, expected):
             with conn:
@@ -771,25 +772,9 @@ def download_one(
                 )
             LOG.info("Post %s bereits vorhanden und MD5-geprüft: %s", post_id, destination)
             return True
-
         if is_expected_md5:
-            try:
-                unverified_destination.parent.mkdir(parents=True, exist_ok=True)
-                preserved_path = available_path(unverified_destination)
-                move_file_no_overwrite(destination, preserved_path)
-                with conn:
-                    conn.execute(
-                        "UPDATE posts SET verification_status='not_verified', local_path=? WHERE id=?",
-                        (str(preserved_path), post_id),
-                    )
-                LOG.warning(
-                    "Post %s: vorhandene, nicht verifizierbare Datei gesichert unter %s; "
-                    "versuche erneuten Download.",
-                    post_id, preserved_path,
-                )
-            except OSError as exc:
-                mark_download_error(conn, post_id, f"Vorhandene Datei konnte nicht sicher nach not_verified verschoben werden: {exc}")
-                return False
+            existing_corrupt = True
+            LOG.warning("Post %s: vorhandene Datei hat eine falsche MD5; lade Ersatz, bevor die alte Datei verschoben wird.", post_id)
         else:
             # Without an API checksum, retain the existing unverified file and
             # give the new download a distinct name in not_verified/.
@@ -824,8 +809,12 @@ def download_one(
             else:
                 reason = f"MD5-Prüfung fehlgeschlagen (erwartet {expected}, erhalten {actual}); Datei separat unter not_verified gespeichert."
 
-        # Atomic no-overwrite placement; hard-link fails if the destination already exists.
-        move_file_no_overwrite(temp_path, destination)
+        # Only a fully downloaded and MD5-verified replacement may replace
+        # the corrupt existing target. os.replace is atomic on the same filesystem.
+        if verified and existing_corrupt and destination.exists():
+            os.replace(temp_path, destination)
+        else:
+            move_file_no_overwrite(temp_path, destination)
         temp_path.unlink(missing_ok=True)
         with conn:
             conn.execute(
@@ -839,7 +828,21 @@ def download_one(
         return True
     except Exception as exc:
         temp_path.unlink(missing_ok=True)
-        mark_download_error(conn, post_id, str(exc))
+        if existing_corrupt and destination.exists():
+            try:
+                unverified_destination.parent.mkdir(parents=True, exist_ok=True)
+                preserved_path = available_path(unverified_destination)
+                move_file_no_overwrite(destination, preserved_path)
+                with conn:
+                    conn.execute(
+                        "UPDATE posts SET downloaded=0, verification_status='not_verified', local_path=?, download_error=? WHERE id=?",
+                        (str(preserved_path), str(exc)[:2000], post_id),
+                    )
+                LOG.warning("Post %s: Ersatzdownload fehlgeschlagen; alte Datei nach not_verified verschoben: %s", post_id, preserved_path)
+            except OSError as move_exc:
+                mark_download_error(conn, post_id, f"{exc}; alte Datei konnte nicht nach not_verified verschoben werden: {move_exc}")
+        else:
+            mark_download_error(conn, post_id, str(exc))
         LOG.error("Download für Post %s fehlgeschlagen: %s", post_id, exc)
         return False
 
