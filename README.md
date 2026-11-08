@@ -18,6 +18,9 @@ python e6ai_archive.py --download
 
 # Nach Abbruch nur die noch offenen Downloads fortsetzen
 python e6ai_archive.py --download-only
+
+# Parallele Downloads (Standard: 3 Worker; global adaptives Request-Limit)
+python e6ai_archive.py --download-only --workers 3
 ```
 
 Jeder Post wird genau einem Ordner zugeordnet:
