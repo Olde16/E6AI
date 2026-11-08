@@ -8,7 +8,8 @@ e6AI personal archive
 API behavior follows the supplied e6AI API documentation:
   GET /posts.json, limit <= 320
   first page without `page`; subsequent pages with page=b<lowest post ID>
-  custom non-empty User-Agent; sustained request rate <= 1 request/second.
+  custom non-empty User-Agent; adaptive shared limiter targets ~1 request/second,
+  with a 0.9-second floor and global backoff on throttling responses.
 
 Examples:
   python e6ai_archive.py --max-pages 3
@@ -51,7 +52,8 @@ DEFAULT_DB = Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3
 DIRECTOR_TAG_CATEGORIES = {"director", "artist"}
 CHARACTER_TAG_CATEGORY = "character"
 DEFAULT_USER_AGENT = "e6AI-Personal-Archive/1.0 (metadata and original-file archival)"
-REQUEST_INTERVAL = 1.15
+MIN_REQUEST_INTERVAL = 0.9
+INITIAL_REQUEST_INTERVAL = 1.0
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 60
 CHUNK_SIZE = 1024 * 1024
@@ -76,7 +78,7 @@ def configure_logging(verbose: bool = False) -> None:
 class AdaptiveRateLimiter:
     """Ein gemeinsamer, adaptiver Request-Takt für alle Download-Worker."""
 
-    def __init__(self, min_interval: float = 0.9, initial_interval: float = 1.0) -> None:
+    def __init__(self, min_interval: float = MIN_REQUEST_INTERVAL, initial_interval: float = INITIAL_REQUEST_INTERVAL) -> None:
         self.min_interval = min_interval
         self.interval = max(min_interval, initial_interval)
         self.lock = threading.Lock()
