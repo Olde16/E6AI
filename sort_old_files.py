@@ -17,6 +17,8 @@ import shutil
 import sqlite3
 from pathlib import Path
 
+from e6ai_archive import DEFAULT_USER_AGENT, RateLimitedSession, download_one, move_file_no_overwrite
+
 DEFAULT_ROOT = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
 DIRECTOR_CATEGORIES = {"director", "artist"}
 CHARACTER_CATEGORY = "character"
@@ -122,6 +124,8 @@ def main() -> int:
         moved = 0
         skipped = 0
         conflicts = 0
+        retried = 0
+        client = RateLimitedSession(DEFAULT_USER_AGENT)
         print(f"Durchsuche Altbestand: {old_dir}", flush=True)
         file_count = 0
         for dirpath, dirnames, filenames in os.walk(old_dir):
@@ -143,7 +147,50 @@ def main() -> int:
                     continue
 
                 target_folder, expected_md5 = target_for_post(conn, root, post_id)
-                if target_folder is not None and verify_md5(source, expected_md5):
+                source_verified = target_folder is not None and verify_md5(source, expected_md5)
+                fresh_path: Path | None = None
+
+                if target_folder is not None and expected_md5 and not source_verified:
+                    print(f"MD5 stimmt nicht – versuche Original erneut herunterzuladen: Post {post_id}", flush=True)
+                    if not args.dry_run:
+                        row = conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+                        if row is not None and row["file_url"] and download_one(conn, client, row, root):
+                            refreshed = conn.execute(
+                                "SELECT verification_status, local_path FROM posts WHERE id=?",
+                                (post_id,),
+                            ).fetchone()
+                            if refreshed and refreshed["verification_status"] == "verified" and refreshed["local_path"]:
+                                fresh_path = Path(refreshed["local_path"])
+                                retried += 1
+                                print(f"Erneut heruntergeladen und MD5-verifiziert: {fresh_path}", flush=True)
+                        elif row is None or not row["file_url"]:
+                            print(f"Kein erneuter Download möglich: file.url fehlt für Post {post_id}.", flush=True)
+
+                if fresh_path is not None:
+                    # Preserve the corrupt legacy copy for manual inspection.
+                    destination = root / "not_verified" / source.name
+                    if destination.exists():
+                        print(f"KONFLIKT (not_verified-Ziel existiert; Quelle bleibt in old): {source}")
+                        conflicts += 1
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    move_without_overwrite(source, destination)
+
+                    # Deleted posts are kept together for later manual sorting.
+                    if target_folder == root / "deleted":
+                        deleted_destination = root / "deleted" / fresh_path.name
+                        if fresh_path != deleted_destination:
+                            if deleted_destination.exists():
+                                print(f"KONFLIKT (deleted-Ziel existiert; frischer Download bleibt unter {fresh_path})")
+                                conflicts += 1
+                            else:
+                                move_without_overwrite(fresh_path, deleted_destination)
+                                with conn:
+                                    conn.execute("UPDATE posts SET local_path=? WHERE id=?", (str(deleted_destination), post_id))
+                    moved += 1
+                    continue
+
+                if source_verified:
                     destination = target_folder / source.name
                     reason = "gelöschter Beitrag (API-Flag deleted)" if target_folder == root / "deleted" else "MD5 stimmt"
                 else:
@@ -153,7 +200,7 @@ def main() -> int:
                     elif not expected_md5:
                         reason = "MD5 fehlt in SQLite"
                     else:
-                        reason = "MD5 stimmt nicht"
+                        reason = "MD5 stimmt nicht; erneuter Download fehlgeschlagen oder Vorschau"
 
                 if destination.exists():
                     print(f"KONFLIKT ({reason}; Ziel existiert; Quelle bleibt in old): {source} -> {destination}")
@@ -163,11 +210,10 @@ def main() -> int:
                 print(f"{'VORSCHAU' if args.dry_run else 'VERSCHIEBE'} ({reason}): {source} -> {destination}")
                 if not args.dry_run:
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    # Hard-link creation is atomic and refuses to overwrite an existing target.
                     move_without_overwrite(source, destination)
                 moved += 1
         print()
-        print(f"Fertig. {'Vorschau' if args.dry_run else 'Verschoben'}: {moved}; übersprungen: {skipped}; Konflikte: {conflicts}.")
+        print(f"Fertig. {'Vorschau' if args.dry_run else 'Verschoben'}: {moved}; erneut heruntergeladen: {retried}; übersprungen: {skipped}; Konflikte: {conflicts}.")
         if args.dry_run:
             print("Es wurde nichts verändert. Ohne --dry-run werden die Dateien verschoben.")
         return 0
