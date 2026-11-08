@@ -16,7 +16,7 @@ import sqlite3
 from pathlib import Path
 
 DEFAULT_ROOT = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
-DIRECTOR_CATEGORY = "director"
+DIRECTOR_CATEGORIES = {"director", "artist"}
 CHARACTER_CATEGORY = "character"
 
 
@@ -35,7 +35,7 @@ def target_for_post(conn: sqlite3.Connection, root: Path, post_id: int) -> Path 
     if not rows:
         return None
 
-    directors = sorted({name for category, name in rows if str(category).casefold() == DIRECTOR_CATEGORY})
+    directors = sorted({name for category, name in rows if str(category).casefold() in DIRECTOR_CATEGORIES})
     characters = sorted({name for category, name in rows if str(category).casefold() == CHARACTER_CATEGORY})
     director = directors[0] if len(directors) == 1 else ("collabs" if len(directors) > 1 else "unknown")
     character = characters[0] if len(characters) == 1 else ("multiple" if len(characters) > 1 else "unknown")
