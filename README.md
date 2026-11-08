@@ -22,30 +22,30 @@ python e6ai_archive.py --download-only
 
 Jeder Post wird genau einem Ordner zugeordnet:
 
-- ein Director + ein Character: `<Director>/<Character>/<postID>.<ext>`
-- mehrere Directors: `collabs/`
-- kein Director: `unknown/`
-- mehrere Characters: `multiple/`
-- kein Character: `unknown/`
+- ein Director/Artist-Tag + ein Character-Tag: `<Director>/<Character>/<postID>.<ext>`
+- mehrere Director/Artist-Tags: `collabs/`
+- kein Director/Artist-Tag: `unknown/`
+- mehrere Character-Tags: `multiple/`
+- kein Character-Tag: `unknown/`
 - fehlende oder nicht passende MD5-Prüfung: `not_verified/<postID>.<ext>`
 
-Eine Datei wird nur dann als verifiziert markiert, wenn eine API-MD5 vorhanden ist und exakt übereinstimmt. Nicht verifizierbare, aber abrufbare Dateien bleiben unter `not_verified/` erhalten. Ohne abrufbare Datei-URL bleiben die Metadaten in SQLite und der Fehler wird protokolliert. Bestehende Zieldateien werden niemals überschrieben.
+Die API-Kategorie `artist` wird als Director-Zuordnung behandelt; `director` wird ebenfalls akzeptiert. Eine Datei wird nur dann als verifiziert markiert, wenn eine API-MD5 vorhanden ist und exakt übereinstimmt. Nicht verifizierbare, aber abrufbare Dateien bleiben unter `not_verified/` erhalten. Ohne abrufbare Datei-URL bleiben die Metadaten in SQLite und der Fehler wird protokolliert. Bestehende Zieldateien werden niemals überschrieben.
+
+Vor Downloads prüft das Skript den verfügbaren Speicherplatz und vergleicht ihn mit der aus den API-Dateigrößen geschätzten offenen Datenmenge. Die Zusammenfassung zeigt Gesamtgröße, gesicherte Größe und offene Größe.
 
 ## Altbestand vorsortieren
 
-Den bisherigen Bestand vorher manuell nach `TWS_AI_DB/old/` legen. Das Sortierskript verändert ihn standardmäßig nicht:
+Den bisherigen Bestand vorher nach `TWS_AI_DB/old/` legen. Das Sortierskript verschiebt die Dateien bei normaler Ausführung. Es fragt nicht interaktiv nach einer weiteren Bestätigung: Das Ausführen ist die Freigabe.
 
 ```bash
+# Vorschau, ohne Änderungen
+python sort_old_files.py --dry-run
+
+# Dateien tatsächlich einsortieren
 python sort_old_files.py
 ```
 
-Wenn die Vorschau stimmt, werden die Dateien mit folgendem Befehl verschoben:
-
-```bash
-python sort_old_files.py --apply
-```
-
-Das Skript fragt nicht interaktiv nach einer weiteren Bestätigung. Der Aufruf mit `--apply` ist die Ausführungsfreigabe. Dateien ohne passende Post-ID/Metadaten und Zielkonflikte bleiben in `old/`; vorhandene Zieldateien werden nicht überschrieben.
+Dateien ohne passende Post-ID/Metadaten und Zielkonflikte bleiben in `old/`; vorhandene Zieldateien werden nicht überschrieben.
 
 Optionen für abweichende Pfade:
 
