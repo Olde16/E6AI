@@ -122,38 +122,49 @@ def main() -> int:
         moved = 0
         skipped = 0
         conflicts = 0
-        for source in sorted(p for p in old_dir.rglob("*") if p.is_file()):
-            try:
-                post_id = int(source.stem)
-            except ValueError:
-                print(f"ÜBERSPRUNGEN (Dateiname ohne numerische Post-ID): {source}")
-                skipped += 1
-                continue
+        print(f"Durchsuche Altbestand: {old_dir}", flush=True)
+        file_count = 0
+        for dirpath, dirnames, filenames in os.walk(old_dir):
+                dirnames.sort()
+                filenames.sort()
+                for filename in filenames:
+                    source = Path(dirpath) / filename
+                    if not source.is_file():
+                        continue
+                    file_count += 1
+                    if file_count == 1 or file_count % 1000 == 0:
+                        print(f"Gefundene Dateien: {file_count}", flush=True)
+                try:
+                    post_id = int(source.stem)
+                except ValueError:
+                    print(f"ÜBERSPRUNGEN (Dateiname ohne numerische Post-ID): {source}")
+                    skipped += 1
+                    continue
 
-            target_folder, expected_md5 = target_for_post(conn, root, post_id)
-            if target_folder is not None and verify_md5(source, expected_md5):
-                destination = target_folder / source.name
-                reason = "gelöschter Beitrag (API-Flag deleted)" if target_folder == root / "deleted" else "MD5 stimmt"
-            else:
-                destination = root / "not_verified" / source.name
-                if target_folder is None:
-                    reason = "kein Post-Eintrag in SQLite"
-                elif not expected_md5:
-                    reason = "MD5 fehlt in SQLite"
+                target_folder, expected_md5 = target_for_post(conn, root, post_id)
+                if target_folder is not None and verify_md5(source, expected_md5):
+                    destination = target_folder / source.name
+                    reason = "gelöschter Beitrag (API-Flag deleted)" if target_folder == root / "deleted" else "MD5 stimmt"
                 else:
-                    reason = "MD5 stimmt nicht"
+                    destination = root / "not_verified" / source.name
+                    if target_folder is None:
+                        reason = "kein Post-Eintrag in SQLite"
+                    elif not expected_md5:
+                        reason = "MD5 fehlt in SQLite"
+                    else:
+                        reason = "MD5 stimmt nicht"
 
-            if destination.exists():
-                print(f"KONFLIKT ({reason}; Ziel existiert; Quelle bleibt in old): {source} -> {destination}")
-                conflicts += 1
-                continue
+                if destination.exists():
+                    print(f"KONFLIKT ({reason}; Ziel existiert; Quelle bleibt in old): {source} -> {destination}")
+                    conflicts += 1
+                    continue
 
-            print(f"{'VORSCHAU' if args.dry_run else 'VERSCHIEBE'} ({reason}): {source} -> {destination}")
-            if not args.dry_run:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                # Hard-link creation is atomic and refuses to overwrite an existing target.
-                move_without_overwrite(source, destination)
-            moved += 1
+                print(f"{'VORSCHAU' if args.dry_run else 'VERSCHIEBE'} ({reason}): {source} -> {destination}")
+                if not args.dry_run:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    # Hard-link creation is atomic and refuses to overwrite an existing target.
+                    move_without_overwrite(source, destination)
+                moved += 1
 
         print()
         print(f"Fertig. {'Vorschau' if args.dry_run else 'Verschoben'}: {moved}; übersprungen: {skipped}; Konflikte: {conflicts}.")
