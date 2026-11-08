@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+e6AI personal archive
+- Archives post metadata and tag categories to SQLite.
+- Optionally downloads original files referenced by each post.
+- Does not request comments, accounts, favorites, messages, votes, notes, or pools.
+
+API behavior follows the supplied e6AI API documentation:
+  GET /posts.json, limit <= 320
+  first page without `page`; subsequent pages with page=b<lowest post ID>
+  custom non-empty User-Agent; sustained request rate <= 1 request/second.
+
+Examples:
+  python e6ai_archive.py --max-pages 3
+  python e6ai_archive.py --download
+  python e6ai_archive.py --max-pages 3 --download
+  python e6ai_archive.py --restart-scan
+  python e6ai_archive.py --download-only
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+API_BASE = "https://e6ai.net"
+POSTS_ENDPOINT = f"{API_BASE}/posts.json"
+API_LIMIT = 320
+DEFAULT_DB = Path("archive/e6ai_archive.sqlite3")
+DEFAULT_IMAGE_DIR = Path("archive/images")
+DEFAULT_USER_AGENT = "e6AI-Personal-Archive/1.0 (metadata and original-file archival)"
+REQUEST_INTERVAL = 1.15
+CONNECT_TIMEOUT = 15
+READ_TIMEOUT = 60
+CHUNK_SIZE = 1024 * 1024
+LOG = logging.getLogger("e6ai_archive")
+
+
+class ArchiveError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def configure_logging(verbose: bool = False) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+class RateLimitedSession:
+    """A requests session that spaces requests and retries transient server errors."""
+
+    def __init__(self, user_agent: str) -> None:
+        if not user_agent.strip():
+            raise ValueError("Der User-Agent darf nicht leer sein.")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": user_agent,
+            "Accept": "application/json, */*;q=0.8",
+        })
+        retry = Retry(
+            total=5,
+            connect=3,
+            read=3,
+            status=5,
+            backoff_factor=2,
+            status_forcelist=(429, 500, 502, 503, 504, 520, 522, 524, 525),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.last_request = 0.0
+
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        elapsed = time.monotonic() - self.last_request
+        if elapsed < REQUEST_INTERVAL:
+            time.sleep(REQUEST_INTERVAL - elapsed)
+        self.last_request = time.monotonic()
+        try:
+            response = self.session.get(
+                url,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                stream=kwargs.pop("stream", False),
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            raise ArchiveError(f"Verbindungsfehler bei {url}: {exc}") from exc
+
+        if response.status_code >= 400:
+            body = ""
+            if not kwargs.get("stream", False):
+                body = response.text[:1200].replace("\n", " ")
+            raise ArchiveError(
+                f"HTTP {response.status_code} bei {response.url}; "
+                f"Content-Type={response.headers.get('Content-Type')!r}; "
+                f"Antwort={body!r}"
+            )
+        return response
+
+    def close(self) -> None:
+        self.session.close()
+
+
+def connect_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS posts (
+        id              INTEGER PRIMARY KEY,
+        created_at      TEXT,
+        updated_at      TEXT,
+        change_seq      INTEGER,
+        rating          TEXT,
+        description     TEXT,
+        source          TEXT,
+        parent_id       INTEGER,
+        has_children    INTEGER,
+        is_deleted      INTEGER,
+        width           INTEGER,
+        height          INTEGER,
+        extension       TEXT,
+        file_size       INTEGER,
+        md5             TEXT,
+        file_url        TEXT,
+        local_path      TEXT,
+        downloaded      INTEGER NOT NULL DEFAULT 0,
+        download_error  TEXT,
+        scanned_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS tags (
+        name            TEXT PRIMARY KEY,
+        category        TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS post_tags (
+        post_id         INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+        tag_name        TEXT NOT NULL REFERENCES tags(name),
+        PRIMARY KEY (post_id, tag_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS scan_state (
+        key             TEXT PRIMARY KEY,
+        value           TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_posts_downloaded ON posts(downloaded);
+    CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags(tag_name);
+    """)
+    conn.commit()
+    return conn
+
+
+def state_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM scan_state WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else default
+
+
+def state_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO scan_state(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def as_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+
+def save_post(conn: sqlite3.Connection, post: dict[str, Any]) -> None:
+    post_id = as_int(post.get("id"))
+    if post_id is None:
+        LOG.warning("Überspringe Beitrag ohne gültige ID.")
+        return
+
+    file_info = post.get("file") or {}
+    relationships = post.get("relationships") or {}
+
+    # Listen und Objekte als JSON speichern, damit SQLite sie akzeptiert.
+    sources = post.get("sources")
+    if sources is not None:
+        sources = json.dumps(sources, ensure_ascii=False)
+
+    values = (
+        post_id,
+        post.get("created_at"),
+        post.get("updated_at"),
+        as_int(post.get("change_seq")),
+        post.get("rating"),
+        post.get("description"),
+        sources,
+        as_int(relationships.get("parent_id")),
+        int(bool(relationships.get("has_children")))
+        if "has_children" in relationships else None,
+        int(bool((post.get("flags") or {}).get("deleted"))),
+        as_int(file_info.get("width")),
+        as_int(file_info.get("height")),
+        file_info.get("ext"),
+        as_int(file_info.get("size")),
+        file_info.get("md5"),
+        file_info.get("url"),
+        None,
+        0,
+        None,
+        utc_now(),
+    )
+
+    conn.execute("""
+        INSERT INTO posts (
+            id, created_at, updated_at, change_seq, rating, description, source,
+            parent_id, has_children, is_deleted, width, height, extension, file_size, md5,
+            file_url, local_path, downloaded, download_error, scanned_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at,
+            change_seq=excluded.change_seq,
+            rating=excluded.rating,
+            description=excluded.description,
+            source=excluded.source,
+            parent_id=excluded.parent_id,
+            has_children=excluded.has_children,
+            is_deleted=excluded.is_deleted,
+            downloaded=CASE
+                WHEN posts.md5 IS NOT excluded.md5
+                  OR posts.file_url IS NOT excluded.file_url
+                THEN 0 ELSE posts.downloaded
+            END,
+            local_path=CASE
+                WHEN posts.md5 IS NOT excluded.md5
+                  OR posts.file_url IS NOT excluded.file_url
+                THEN NULL ELSE posts.local_path
+            END,
+            download_error=CASE
+                WHEN posts.md5 IS NOT excluded.md5
+                  OR posts.file_url IS NOT excluded.file_url
+                THEN NULL ELSE posts.download_error
+            END,
+            width=excluded.width,
+            height=excluded.height,
+            extension=excluded.extension,
+            file_size=excluded.file_size,
+            md5=excluded.md5,
+            file_url=excluded.file_url,
+            scanned_at=excluded.scanned_at
+    """, values)
+
+    # Alle bisherigen Tag-Zuordnungen dieses Beitrags ersetzen.
+    tags_obj = post.get("tags") or {}
+    if not isinstance(tags_obj, dict):
+        tags_obj = {}
+
+    conn.execute(
+        "DELETE FROM post_tags WHERE post_id=?",
+        (post_id,)
+    )
+
+    # Sämtliche Tag-Kategorien dynamisch übernehmen.
+    for category, names in tags_obj.items():
+        if not isinstance(category, str) or not isinstance(names, list):
+            continue
+
+        for name in names:
+            if not isinstance(name, str) or not name:
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO tags(name, category)
+                VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE
+                SET category=excluded.category
+                """,
+                (name, category),
+            )
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO post_tags(post_id, tag_name)
+                VALUES (?, ?)
+                """,
+                (post_id, name),
+            )
+
+
+
+def fetch_posts(client: RateLimitedSession, page: str | None) -> list[dict[str, Any]]:
+    # status:any includes deleted posts as documented by e6AI;
+    # some may no longer have a file URL.
+    params: dict[str, Any] = {
+        "limit": API_LIMIT,
+        "tags": "status:any"
+    }
+
+    if page:
+        params["page"] = page
+
+    response = client.get(POSTS_ENDPOINT, params=params)
+
+    content_type = response.headers.get("Content-Type", "")
+
+    try:
+        payload = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        preview = response.text[:1500].replace("\n", " ")
+        raise ArchiveError(
+            f"API lieferte kein gültiges JSON (HTTP {response.status_code}, "
+            f"Content-Type={content_type!r}). Antwortanfang: {preview!r}"
+        ) from exc
+
+    # NEU: API kann ein Objekt mit dem Schlüssel "posts" zurückgeben.
+    # Beispiel: {"posts": [{...}, {...}]}
+    if isinstance(payload, dict):
+        posts = payload.get("posts")
+
+        if not isinstance(posts, list):
+            preview = json.dumps(payload, ensure_ascii=False)[:1500]
+            raise ArchiveError(
+                "API-Antwort ist ein JSON-Objekt, enthält aber keine "
+                f"gültige 'posts'-Liste: {preview}"
+            )
+
+        payload = posts
+
+    # Prüfen, ob tatsächlich eine Liste angekommen ist.
+    if not isinstance(payload, list):
+        preview = json.dumps(payload, ensure_ascii=False)[:1500]
+        raise ArchiveError(
+            "Unerwartetes API-Format: erwartet wurde ein JSON-Array "
+            "oder ein Objekt mit 'posts'-Array, "
+            f"erhalten wurde {type(payload).__name__}: {preview}"
+        )
+
+    if any(not isinstance(item, dict) for item in payload):
+        raise ArchiveError(
+            "API-Array enthält mindestens einen ungültigen Eintrag."
+        )
+
+    return payload
+
+
+def scan_posts(
+    conn: sqlite3.Connection,
+    client: RateLimitedSession,
+    max_pages: int | None,
+    restart: bool,
+) -> None:
+    if restart:
+        state_set(conn, "scan_cursor", "")
+        state_set(conn, "scan_complete", "0")
+        conn.commit()
+
+    if state_get(conn, "scan_complete") == "1" and not restart:
+        LOG.info("Der Metadaten-Scan ist bereits als vollständig markiert.")
+        LOG.info("Für einen erneuten Durchlauf --restart-scan verwenden.")
+        return
+
+    cursor = state_get(conn, "scan_cursor")
+    page_count = 0
+    total = 0
+
+    while True:
+        if max_pages is not None and page_count >= max_pages:
+            LOG.info("Seitenlimit (%s) erreicht; Fortsetzung beim nächsten Start.", max_pages)
+            break
+
+        page_arg = f"b{cursor}" if cursor else None
+        LOG.info("Rufe Beitragsseite ab: %s", page_arg or "neueste Beiträge")
+        posts = fetch_posts(client, page_arg)
+
+        if not posts:
+            state_set(conn, "scan_complete", "1")
+            conn.commit()
+            LOG.info("Keine weiteren Beiträge. Scan abgeschlossen.")
+            break
+
+        # Persist each page atomically before moving the cursor.
+        ids: list[int] = []
+        with conn:
+            for post in posts:
+                save_post(conn, post)
+                post_id = as_int(post.get("id"))
+                if post_id is not None:
+                    ids.append(post_id)
+
+            if not ids:
+                raise ArchiveError("API-Seite enthielt keine verwertbaren Post-IDs.")
+
+            lowest_id = min(ids)
+            cursor = str(lowest_id)
+            state_set(conn, "scan_cursor", cursor)
+            state_set(conn, "scan_complete", "0")
+            state_set(conn, "last_scan_at", utc_now())
+
+        page_count += 1
+        total += len(posts)
+        LOG.info("%s Beiträge verarbeitet; niedrigste ID dieser Seite: %s", len(posts), cursor)
+
+        # A short page means there is no next page in this ordering.
+        if len(posts) < API_LIMIT:
+            with conn:
+                state_set(conn, "scan_complete", "1")
+            LOG.info("Letzte Seite erreicht. Scan abgeschlossen.")
+            break
+
+    LOG.info("In diesem Lauf verarbeitete Beiträge: %s", total)
+
+
+def safe_extension(value: Any) -> str:
+    ext = str(value or "bin").lower().lstrip(".")
+    if not ext.isalnum() or len(ext) > 10:
+        return "bin"
+    return ext
+
+
+def allowed_file_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "e6ai.net" or host.endswith(".e6ai.net"))
+
+
+def verify_md5(path: Path, expected: str | None) -> bool:
+    if not expected:
+        return True
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest().lower() == expected.lower()
+
+
+def download_one(
+    conn: sqlite3.Connection,
+    client: RateLimitedSession,
+    row: sqlite3.Row,
+    image_dir: Path,
+) -> bool:
+    post_id = int(row["id"])
+    url = row["file_url"]
+    if not url:
+        with conn:
+            conn.execute(
+                "UPDATE posts SET download_error=? WHERE id=?",
+                ("Keine file.url in API-Antwort", post_id),
+            )
+        return False
+    if not allowed_file_url(url):
+        with conn:
+            conn.execute(
+                "UPDATE posts SET download_error=? WHERE id=?",
+                ("Datei-URL außerhalb der e6AI-Domain; aus Sicherheitsgründen ausgelassen", post_id),
+            )
+        LOG.warning("Post %s ausgelassen: Datei-URL liegt nicht auf e6AI.", post_id)
+        return False
+
+    ext = safe_extension(row["extension"])
+    image_dir.mkdir(parents=True, exist_ok=True)
+    destination = image_dir / f"{post_id}.{ext}"
+    temp_path = destination.with_suffix(destination.suffix + ".part")
+
+    if destination.exists() and verify_md5(destination, row["md5"]):
+        with conn:
+            conn.execute(
+                "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
+                (str(destination), post_id),
+            )
+        return True
+
+    try:
+        response = client.get(url, stream=True)
+        digest = hashlib.md5()
+        with temp_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if chunk:
+                    handle.write(chunk)
+                    digest.update(chunk)
+        expected = row["md5"]
+        actual = digest.hexdigest()
+        if expected and actual.lower() != str(expected).lower():
+            temp_path.unlink(missing_ok=True)
+            raise ArchiveError(
+                f"MD5-Prüfung fehlgeschlagen (erwartet {expected}, erhalten {actual})"
+            )
+        os.replace(temp_path, destination)
+        with conn:
+            conn.execute(
+                "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
+                (str(destination), post_id),
+            )
+        LOG.info("Post %s heruntergeladen: %s", post_id, destination)
+        return True
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        with conn:
+            conn.execute(
+                "UPDATE posts SET downloaded=0, download_error=? WHERE id=?",
+                (str(exc)[:2000], post_id),
+            )
+        LOG.error("Download für Post %s fehlgeschlagen: %s", post_id, exc)
+        return False
+
+
+def download_pending(
+    conn: sqlite3.Connection,
+    client: RateLimitedSession,
+    image_dir: Path,
+    limit: int | None,
+) -> None:
+    query = "SELECT * FROM posts WHERE downloaded=0 ORDER BY id DESC"
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+    rows = conn.execute(query).fetchall()
+    LOG.info("Noch herunterzuladende Dateien: %s", len(rows))
+    success = 0
+    for row in rows:
+        if download_one(conn, client, row, image_dir):
+            success += 1
+    LOG.info("Downloads erfolgreich: %s von %s", success, len(rows))
+
+
+def print_summary(conn: sqlite3.Connection) -> None:
+    posts = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+    tags = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+    links = conn.execute("SELECT COUNT(*) FROM post_tags").fetchone()[0]
+    downloaded = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=1").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=0").fetchone()[0]
+    LOG.info("Datenbankübersicht:")
+    LOG.info("  Beiträge: %s", posts)
+    LOG.info("  Unterschiedliche Tags: %s", tags)
+    LOG.info("  Post-Tag-Verknüpfungen: %s", links)
+    LOG.info("  Heruntergeladene Originaldateien: %s", downloaded)
+    LOG.info("  Noch nicht heruntergeladen: %s", pending)
+    LOG.info("  Scan-Cursor: %s", state_get(conn, "scan_cursor", "—") or "—")
+    LOG.info("  Scan vollständig: %s", "ja" if state_get(conn, "scan_complete") == "1" else "nein")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Sichert e6AI-Post-Metadaten, Tags und optional Originalbilder."
+    )
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"SQLite-Datei (Standard: {DEFAULT_DB})")
+    parser.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR, help=f"Bildordner (Standard: {DEFAULT_IMAGE_DIR})")
+    parser.add_argument("--user-agent", default=os.environ.get("E6AI_USER_AGENT", DEFAULT_USER_AGENT))
+    parser.add_argument("--max-pages", type=int, default=None, help="Maximale Seitenzahl pro Lauf; ohne Angabe vollständig scannen.")
+    parser.add_argument("--restart-scan", action="store_true", help="Scan-Cursor zurücksetzen und wieder bei den neuesten Beiträgen beginnen.")
+    parser.add_argument("--download", action="store_true", help="Nach dem Metadaten-Scan alle noch fehlenden Originalbilder laden.")
+    parser.add_argument("--download-only", action="store_true", help="Nur bereits erfasste, noch fehlende Originalbilder laden.")
+    parser.add_argument("--download-limit", type=int, default=None, help="Maximale Anzahl Downloads in diesem Lauf.")
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    configure_logging(args.verbose)
+
+    if args.max_pages is not None and args.max_pages < 1:
+        LOG.error("--max-pages muss mindestens 1 sein.")
+        return 2
+    if args.download_limit is not None and args.download_limit < 1:
+        LOG.error("--download-limit muss mindestens 1 sein.")
+        return 2
+    if args.download and args.download_only:
+        LOG.error("--download und --download-only können nicht gleichzeitig verwendet werden.")
+        return 2
+
+    conn = connect_db(args.db)
+    client = RateLimitedSession(args.user_agent)
+    try:
+        if not args.download_only:
+            LOG.info("Starte Metadaten-Scan.")
+            scan_posts(conn, client, args.max_pages, args.restart_scan)
+        if args.download or args.download_only:
+            # A failed scan raises and prevents downloads from starting inadvertently.
+            download_pending(conn, client, args.image_dir, args.download_limit)
+        print_summary(conn)
+        return 0
+    except KeyboardInterrupt:
+        LOG.warning("Abbruch durch Benutzer. Der gespeicherte Cursor erlaubt die Fortsetzung.")
+        print_summary(conn)
+        return 130
+    except Exception as exc:
+        LOG.exception("Archivierung fehlgeschlagen: %s", exc)
+        LOG.info("Der zuletzt gespeicherte Cursor bleibt für die Fortsetzung erhalten.")
+        print_summary(conn)
+        return 1
+    finally:
+        client.close()
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
