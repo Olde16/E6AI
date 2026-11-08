@@ -60,9 +60,9 @@ python sort_old_files.py --root /pfad/TWS_AI_DB --db /pfad/archive.sqlite3
 
 ## Favoriten importieren
 
-Das separate Script `import_favorites.py` liest die Favoriten des angegebenen e6AI-Kontos über `/favorites.json` ein. Benutzername und API-Schlüssel werden beim Start abgefragt; die API-Schlüsseleingabe bleibt verdeckt. Der Schlüssel wird nicht gespeichert.
+Das separate Script `import_favorites.py` liest die Favoriten des angegebenen e6AI-Kontos über die paginierbare Post-Suche `/posts.json?tags=fav:<username>` ein. `/favorites.json` besitzt laut API-Dokumentation keinen dokumentierten Cursor-Parameter und ist deshalb für große Favoritenlisten ungeeignet. Benutzername und API-Schlüssel werden beim Start abgefragt; die API-Schlüsseleingabe bleibt verdeckt. Der Schlüssel wird nicht gespeichert.
 
-Die Favoriten-Postdaten und Tags werden in dieselbe SQLite-Datenbank übernommen. Zusätzlich gibt es die Tabelle `favorites` mit Benutzername, Post-ID und aktuellem Favoritenstatus. Ein vollständiger erfolgreicher Lauf markiert inzwischen entfernte Favoriten als nicht mehr favorisiert. Bei einem API-Fehler wird dieser Abgleich nicht durchgeführt.
+Die Favoriten-Postdaten und Tags werden in dieselbe SQLite-Datenbank übernommen. Zusätzlich gibt es die Tabelle `favorites` mit Benutzername, Post-ID und aktuellem Favoritenstatus. Der Import läuft mit dem dokumentierten `page=b<ID>`-Cursor bis zu einer leeren Ergebnisseite. Nur ein vollständig erfolgreicher Durchlauf markiert inzwischen entfernte Favoriten als nicht mehr favorisiert. Bei API-Fehlern oder fehlendem Pagination-Fortschritt wird dieser Abgleich nicht durchgeführt.
 
 Das Script lädt keine Originaldateien herunter und verändert keine Archivdateien. Es verwendet standardmäßig dieselbe Datenbank unter `archive/e6ai_archive.sqlite3`.
 
