@@ -210,12 +210,20 @@ class RateLimitedSession:
                 status = response.status_code
                 retry_after = self._retry_after_seconds(response.headers.get("Retry-After"))
                 response.close()
-                pause = self.limiter.throttle(status, retry_after, attempt)
-                LOG.warning(
-                    "HTTP %s: globale Drosselung auf %.2f s; Pause %.1f s "
-                    "(Versuch %s/%s).",
-                    status, self.limiter.interval, pause, attempt + 1, self.max_attempts,
-                )
+                if status in (421, 429, 503):
+                    pause = self.limiter.throttle(status, retry_after, attempt)
+                    LOG.warning(
+                        "HTTP %s: echte Drosselung; Request-Abstand jetzt %.2f s; "
+                        "gemeinsame Pause %.1f s (Versuch %s/%s).",
+                        status, self.limiter.interval, pause, attempt + 1, self.max_attempts,
+                    )
+                else:
+                    pause = self.limiter.transient_error(attempt)
+                    LOG.warning(
+                        "HTTP %s bei %s; temporärer Server-/Proxyfehler, "
+                        "Request-Abstand bleibt %.2f s; Pause %.1f s (Versuch %s/%s).",
+                        status, url, self.limiter.interval, pause, attempt + 1, self.max_attempts,
+                    )
                 continue
 
             if response.status_code >= 400:
