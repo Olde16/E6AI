@@ -35,7 +35,7 @@ Vor Downloads prüft das Skript den verfügbaren Speicherplatz und vergleicht ih
 
 ## Altbestand vorsortieren
 
-Den bisherigen Bestand vorher nach `TWS_AI_DB/old/` legen. Das Sortierskript verschiebt die Dateien bei normaler Ausführung. Es fragt nicht interaktiv nach einer weiteren Bestätigung: Das Ausführen ist die Freigabe.
+Den bisherigen Bestand vorher nach `TWS_AI_DB/old/` legen. Erst den Metadaten-Scan vollständig abschließen; das Sortierskript verweigert die Arbeit bei unvollständigem Scan. Danach verschiebt es die Dateien bei normaler Ausführung. Es fragt nicht interaktiv nach einer weiteren Bestätigung: Das Ausführen ist die Freigabe.
 
 ```bash
 # Vorschau, ohne Änderungen
