@@ -72,13 +72,13 @@ def move_without_overwrite(source: Path, destination: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Vorsortierung des Altbestands anhand der e6AI-SQLite-Datenbank.")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="Archiv-Stammverzeichnis.")
-    parser.add_argument("--db", type=Path, default=None, help="SQLite-Datei; Standard: <root>/archive/e6ai_archive.sqlite3")
+    parser.add_argument("--db", type=Path, default=None, help="SQLite-Datei; Standard: archive/e6ai_archive.sqlite3 neben diesem Skript")
     parser.add_argument("--dry-run", action="store_true", help="Nur Vorschau anzeigen; keine Dateien verschieben.")
     args = parser.parse_args()
 
     root = args.root.resolve()
     old_dir = root / "old"
-    db_path = args.db or (root / "archive" / "e6ai_archive.sqlite3")
+    db_path = args.db or (Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3")
     if not old_dir.is_dir():
         parser.error(f"Altbestand-Ordner nicht gefunden: {old_dir}")
     if not db_path.is_file():
