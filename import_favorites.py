@@ -3,7 +3,7 @@
 Importiert die Favoriten eines e6AI-Kontos in die bestehende Archiv-SQLite-Datenbank.
 
 - Fragt Benutzername und API-Schlüssel interaktiv ab (Schlüssel verdeckt).
-- Liest /favorites.json mit HTTP Basic Auth und paginiert über page=b<ID>.
+- Sucht /posts.json mit fav:<username> und paginiert über page=b<ID>.
 - Übernimmt Post-Metadaten und Tags in die vorhandenen Tabellen.
 - Führt eine eigene favorites-Tabelle je Benutzerkonto.
 - Markiert entfernte Favoriten erst nach einem vollständig erfolgreichen Abruf.
@@ -33,7 +33,10 @@ from e6ai_archive import (
 )
 
 LOG = logging.getLogger("import_favorites")
-FAVORITES_ENDPOINT = f"{API_BASE}/favorites.json"
+# /favorites.json liefert laut API-Dokumentation keine Pagination-Parameter.
+# Stattdessen verwenden wir die dokumentierte Post-Suche fav:<username>,
+# deren page=b<ID>-Cursor ausdrücklich unterstützt wird.
+FAVORITES_ENDPOINT = f"{API_BASE}/posts.json"
 
 
 def utc_now() -> str:
@@ -89,7 +92,10 @@ def import_favorites(
     page_number = 0
 
     while True:
-        params: dict[str, Any] = {"limit": API_LIMIT}
+        params: dict[str, Any] = {
+            "limit": API_LIMIT,
+            "tags": f"fav:{username}",
+        }
         if page:
             params["page"] = page
 
@@ -146,9 +152,19 @@ def import_favorites(
         # Die API verwendet für große Listen den ID-Cursor b<ID>.
         # Bei fehlendem Fortschritt abbrechen, statt in einer Schleife zu hängen.
         if not page_ids:
-            LOG.warning("Keine neuen Post-IDs auf der nächsten Seite; Pagination beendet.")
-            break
-        page = f"b{min(page_ids)}"
+            raise ArchiveError(
+                "Die API lieferte eine nicht-leere Seite, aber keine neuen Post-IDs. "
+                "Der Abruf wird als unvollständig behandelt; Favoritenstatus bleibt unverändert."
+            )
+        next_cursor = min(page_ids)
+        if page is not None:
+            previous_cursor = int(page[1:])
+            if next_cursor >= previous_cursor:
+                raise ArchiveError(
+                    f"Pagination machte keinen Fortschritt (vorher {previous_cursor}, "
+                    f"jetzt {next_cursor}); Favoritenstatus bleibt unverändert."
+                )
+        page = f"b{next_cursor}"
 
     # Erst nach vollständig erfolgreichem Abruf werden nicht mehr gelistete
     # Einträge als nicht mehr favorisiert markiert. Bei Fehler/Abbruch bleiben
