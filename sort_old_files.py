@@ -9,6 +9,8 @@ Files that cannot be matched to a post in SQLite remain in old/ untouched.
 from __future__ import annotations
 
 import argparse
+import errno
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -38,6 +40,33 @@ def target_for_post(conn: sqlite3.Connection, root: Path, post_id: int) -> Path 
     director = directors[0] if len(directors) == 1 else ("collabs" if len(directors) > 1 else "unknown")
     character = characters[0] if len(characters) == 1 else ("multiple" if len(characters) > 1 else "unknown")
     return root / safe_folder_name(director) / safe_folder_name(character)
+
+
+def move_without_overwrite(source: Path, destination: Path) -> None:
+    """Move a file without ever replacing an existing destination."""
+    try:
+        os.link(source, destination)
+        source.unlink()
+        return
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            raise
+        if exc.errno != errno.EXDEV:
+            raise
+
+    temp = destination.with_name(destination.name + ".moving.part")
+    try:
+        with source.open("rb") as src, temp.open("xb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(source, temp)
+        os.link(temp, destination)
+        temp.unlink()
+        source.unlink()
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 def main() -> int:
@@ -87,23 +116,8 @@ def main() -> int:
             print(f"{'VERSCHIEBE' if args.apply else 'VORSCHAU'}: {source} -> {destination}")
             if args.apply:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                # Never overwrite. A race that creates destination causes failure, not replacement.
-                try:
-                    source.rename(destination)
-                except OSError:
-                    # Cross-filesystem fallback: copy to a unique temporary file, then
-                    # atomically create the destination without overwriting anything.
-                    temp = destination.with_name(destination.name + ".moving.part")
-                    try:
-                        with source.open("rb") as src, temp.open("xb") as dst:
-                            shutil.copyfileobj(src, dst, length=1024 * 1024)
-                            dst.flush()
-                        shutil.copystat(source, temp)
-                        temp.rename(destination)
-                        source.unlink()
-                    except Exception:
-                        temp.unlink(missing_ok=True)
-                        raise
+                # Hard-link creation is atomic and refuses to overwrite an existing target.
+                move_without_overwrite(source, destination)
             moved += 1
 
         print()
