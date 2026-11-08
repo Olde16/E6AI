@@ -816,6 +816,13 @@ def download_one(
         else:
             move_file_no_overwrite(temp_path, destination)
         temp_path.unlink(missing_ok=True)
+        if existing_corrupt and not verified and (verified_dir / f"{post_id}.{ext}").exists():
+            # The replacement arrived but failed its checksum: retain both
+            # unverified copies outside the normal archive structure.
+            old_target = verified_dir / f"{post_id}.{ext}"
+            preserved_old = available_path(unverified_destination)
+            move_file_no_overwrite(old_target, preserved_old)
+            LOG.warning("Post %s: alte fehlerhafte Zieldatei ebenfalls nach not_verified verschoben: %s", post_id, preserved_old)
         with conn:
             conn.execute(
                 "UPDATE posts SET downloaded=1, verification_status=?, local_path=?, download_error=? WHERE id=?",
