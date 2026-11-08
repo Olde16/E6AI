@@ -41,7 +41,7 @@ API_BASE = "https://e6ai.net"
 POSTS_ENDPOINT = f"{API_BASE}/posts.json"
 API_LIMIT = 320
 DEFAULT_IMAGE_DIR = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
-DEFAULT_DB = DEFAULT_IMAGE_DIR / "archive" / "e6ai_archive.sqlite3"
+DEFAULT_DB = Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3"
 # e6AI/e621-style APIs commonly call the creator category "artist";
 # accept "director" as well for APIs that expose that label directly.
 DIRECTOR_TAG_CATEGORIES = {"director", "artist"}
