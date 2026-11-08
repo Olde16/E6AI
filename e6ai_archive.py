@@ -676,6 +676,17 @@ def not_verified_path(image_dir: Path, post_id: int, extension: str) -> Path:
     return image_dir / "not_verified" / f"{post_id}.{extension}"
 
 
+def available_path(path: Path) -> Path:
+    """Return path or a numbered sibling without replacing an existing file."""
+    if not path.exists():
+        return path
+    for number in range(1, 100000):
+        candidate = path.with_name(f"{path.stem}.{number}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise ArchiveError(f"Kein freier Dateiname neben {path} gefunden.")
+
+
 def move_file_no_overwrite(source: Path, destination: Path) -> None:
     """Move/link a file without replacing an existing destination."""
     try:
@@ -749,7 +760,8 @@ def download_one(
     destination = (verified_dir / f"{post_id}.{ext}") if is_expected_md5 else unverified_destination
     destination_dir.mkdir(parents=True, exist_ok=True)
 
-    # Existing target files are never overwritten.
+    # Existing target files are never overwritten. A verified file is reused;
+    # an invalid one is preserved under a unique name before trying a fresh download.
     if destination.exists():
         if is_expected_md5 and verify_md5(destination, expected):
             with conn:
@@ -759,26 +771,34 @@ def download_one(
                 )
             LOG.info("Post %s bereits vorhanden und MD5-geprüft: %s", post_id, destination)
             return True
-        if is_expected_md5 and not unverified_destination.exists():
-            # Preserve a pre-existing corrupt/unverifiable target separately, then
-            # fetch a fresh copy. Both operations are no-overwrite hard-link moves.
+
+        if is_expected_md5:
             try:
                 unverified_destination.parent.mkdir(parents=True, exist_ok=True)
-                move_file_no_overwrite(destination, unverified_destination)
+                preserved_path = available_path(unverified_destination)
+                move_file_no_overwrite(destination, preserved_path)
                 with conn:
                     conn.execute(
                         "UPDATE posts SET verification_status='not_verified', local_path=? WHERE id=?",
-                        (str(unverified_destination), post_id),
+                        (str(preserved_path), post_id),
                     )
+                LOG.warning(
+                    "Post %s: vorhandene, nicht verifizierbare Datei gesichert unter %s; "
+                    "versuche erneuten Download.",
+                    post_id, preserved_path,
+                )
             except OSError as exc:
-                mark_download_error(conn, post_id, f"Vorhandene Datei nicht verifizierbar und konnte nicht sicher nach not_verified verschoben werden: {exc}")
+                mark_download_error(conn, post_id, f"Vorhandene Datei konnte nicht sicher nach not_verified verschoben werden: {exc}")
                 return False
         else:
-            mark_download_error(conn, post_id, f"Zieldatei existiert bereits und kann nicht sicher übernommen werden: {destination}; nicht überschrieben.")
-            LOG.error("Post %s: Zieldatei existiert bereits; nicht überschrieben.", post_id)
-            return False
+            # Without an API checksum, retain the existing unverified file and
+            # give the new download a distinct name in not_verified/.
+            destination = available_path(destination)
 
     temp_path = destination.with_name(destination.name + ".part")
+    # A .part file can remain after a power loss or forced termination.
+    # It is incomplete by definition, so remove it before starting this download.
+    temp_path.unlink(missing_ok=True)
     try:
         response = client.get(url, stream=True)
         digest = hashlib.md5()
@@ -797,7 +817,7 @@ def download_one(
             destination = verified_dir / f"{post_id}.{ext}"
             destination.parent.mkdir(parents=True, exist_ok=True)
         else:
-            destination = unverified_destination
+            destination = available_path(unverified_destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not is_expected_md5:
                 reason = "API liefert keine MD5-Prüfsumme; Datei separat unter not_verified gespeichert."
