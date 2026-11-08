@@ -56,3 +56,18 @@ Optionen für abweichende Pfade:
 python e6ai_archive.py --db /pfad/archive.sqlite3 --image-dir /pfad/TWS_AI_DB --download
 python sort_old_files.py --root /pfad/TWS_AI_DB --db /pfad/archive.sqlite3
 ```
+
+
+## Favoriten importieren
+
+Das separate Script `import_favorites.py` liest die Favoriten des angegebenen e6AI-Kontos über `/favorites.json` ein. Benutzername und API-Schlüssel werden beim Start abgefragt; die API-Schlüsseleingabe bleibt verdeckt. Der Schlüssel wird nicht gespeichert.
+
+Die Favoriten-Postdaten und Tags werden in dieselbe SQLite-Datenbank übernommen. Zusätzlich gibt es die Tabelle `favorites` mit Benutzername, Post-ID und aktuellem Favoritenstatus. Ein vollständiger erfolgreicher Lauf markiert inzwischen entfernte Favoriten als nicht mehr favorisiert. Bei einem API-Fehler wird dieser Abgleich nicht durchgeführt.
+
+Das Script lädt keine Originaldateien herunter und verändert keine Archivdateien. Es verwendet standardmäßig dieselbe Datenbank unter `archive/e6ai_archive.sqlite3`.
+
+```bash
+python import_favorites.py
+```
+
+Für den API-Abruf wird ein Request-Abstand von mindestens einer Sekunde verwendet.
