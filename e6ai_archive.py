@@ -164,6 +164,7 @@ def connect_db(path: Path) -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS post_tags (
         post_id         INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
         tag_name        TEXT NOT NULL REFERENCES tags(name),
+        category        TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (post_id, tag_name)
     );
 
@@ -475,9 +476,12 @@ def verify_md5(path: Path, expected: str | None) -> bool:
     if not expected or not str(expected).strip():
         return False
     digest = hashlib.md5()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(CHUNK_SIZE), b""):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(CHUNK_SIZE), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
     return digest.hexdigest().lower() == str(expected).strip().lower()
 
 
@@ -555,9 +559,19 @@ def download_one(
                 )
             LOG.info("Post %s bereits vorhanden und MD5-geprüft: %s", post_id, destination)
             return True
-        mark_download_error(conn, post_id, f"Zieldatei existiert bereits und kann nicht sicher übernommen werden: {destination}; nicht überschrieben.")
-        LOG.error("Post %s: Zieldatei existiert bereits; nicht überschrieben.", post_id)
-        return False
+        if is_expected_md5 and not unverified_destination.exists():
+            # Preserve a pre-existing corrupt/unverifiable target separately, then
+            # fetch a fresh copy. Both operations are no-overwrite hard-link moves.
+            try:
+                os.link(destination, unverified_destination)
+                destination.unlink()
+            except OSError as exc:
+                mark_download_error(conn, post_id, f"Vorhandene Datei nicht verifizierbar und konnte nicht sicher nach not_verified verschoben werden: {exc}")
+                return False
+        else:
+            mark_download_error(conn, post_id, f"Zieldatei existiert bereits und kann nicht sicher übernommen werden: {destination}; nicht überschrieben.")
+            LOG.error("Post %s: Zieldatei existiert bereits; nicht überschrieben.", post_id)
+            return False
 
     temp_path = destination.with_name(destination.name + ".part")
     try:
