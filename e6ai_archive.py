@@ -21,6 +21,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import email.utils
 import errno
 import hashlib
 import json
@@ -29,6 +31,7 @@ import os
 import sqlite3
 import shutil
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -70,62 +73,155 @@ def configure_logging(verbose: bool = False) -> None:
     )
 
 
-class RateLimitedSession:
-    """A requests session that spaces requests and retries transient server errors."""
+class AdaptiveRateLimiter:
+    """Ein gemeinsamer, adaptiver Request-Takt für alle Download-Worker."""
 
-    def __init__(self, user_agent: str) -> None:
+    def __init__(self, min_interval: float = 0.9, initial_interval: float = 1.0) -> None:
+        self.min_interval = min_interval
+        self.interval = max(min_interval, initial_interval)
+        self.lock = threading.Lock()
+        self.next_request_at = 0.0
+        self.cooldown_until = 0.0
+        self.success_streak = 0
+        self.throttle_count = 0
+
+    def wait_turn(self) -> None:
+        # Sleep under the lock so workers cannot all wake and burst together.
+        with self.lock:
+            now = time.monotonic()
+            wait_until = max(self.next_request_at, self.cooldown_until)
+            if wait_until > now:
+                time.sleep(wait_until - now)
+            now = time.monotonic()
+            self.next_request_at = now + self.interval
+
+    def success(self) -> None:
+        with self.lock:
+            self.success_streak += 1
+            if self.success_streak >= 20:
+                self.interval = max(self.min_interval, self.interval - 0.01)
+                self.success_streak = 0
+                self.throttle_count = 0
+
+    def throttle(self, status: int, retry_after: float | None, attempt: int) -> float:
+        with self.lock:
+            self.success_streak = 0
+            self.throttle_count += 1
+            self.interval = min(10.0, max(self.interval * 1.5, self.min_interval))
+            if retry_after is not None:
+                pause = max(0.0, retry_after)
+            elif status == 421:
+                pause = min(300.0, 60.0 * (2 ** min(attempt, 2)))
+            elif status in (429, 503):
+                pause = min(180.0, 10.0 * (2 ** min(attempt, 4)))
+            else:
+                pause = min(60.0, 2.0 * (2 ** min(attempt, 4)))
+            self.cooldown_until = max(self.cooldown_until, time.monotonic() + pause)
+            return pause
+
+
+class RateLimitedSession:
+    """Thread-local HTTP sessions with one shared adaptive global rate limiter."""
+
+    RETRYABLE_STATUS = {421, 429, 500, 502, 503, 504, 520, 522, 524, 525}
+
+    def __init__(
+        self,
+        user_agent: str,
+        limiter: AdaptiveRateLimiter | None = None,
+        max_attempts: int = 5,
+    ) -> None:
         if not user_agent.strip():
             raise ValueError("Der User-Agent darf nicht leer sein.")
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": user_agent,
-            "Accept": "application/json, */*;q=0.8",
-        })
-        retry = Retry(
-            total=5,
-            connect=3,
-            read=3,
-            status=5,
-            backoff_factor=2,
-            status_forcelist=(429, 500, 502, 503, 504, 520, 522, 524, 525),
-            allowed_methods=frozenset({"GET"}),
-            respect_retry_after_header=True,
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-        self.last_request = 0.0
+        self.user_agent = user_agent
+        self.limiter = limiter or AdaptiveRateLimiter()
+        self.max_attempts = max_attempts
+        self.local = threading.local()
+        self.sessions: list[requests.Session] = []
+        self.sessions_lock = threading.Lock()
+
+    def _session(self) -> requests.Session:
+        session = getattr(self.local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": self.user_agent,
+                "Accept": "application/json, */*;q=0.8",
+            })
+            # Retries are handled here so every retry passes through the shared limiter.
+            adapter = HTTPAdapter(max_retries=Retry(total=0), pool_connections=2, pool_maxsize=2)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self.local.session = session
+            with self.sessions_lock:
+                self.sessions.append(session)
+        return session
+
+    @staticmethod
+    def _retry_after_seconds(value: str | None) -> float | None:
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value.strip()))
+        except (TypeError, ValueError):
+            try:
+                parsed = email.utils.parsedate_to_datetime(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                return None
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         stream = kwargs.pop("stream", False)
-        elapsed = time.monotonic() - self.last_request
-        if elapsed < REQUEST_INTERVAL:
-            time.sleep(REQUEST_INTERVAL - elapsed)
-        self.last_request = time.monotonic()
-        try:
-            response = self.session.get(
-                url,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                stream=stream,
-                **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise ArchiveError(f"Verbindungsfehler bei {url}: {exc}") from exc
+        last_error: Exception | None = None
+        for attempt in range(self.max_attempts):
+            self.limiter.wait_turn()
+            try:
+                response = self._session().get(
+                    url,
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                    stream=stream,
+                    **kwargs,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt + 1 >= self.max_attempts:
+                    break
+                self.limiter.throttle(0, None, attempt)
+                continue
 
-        if response.status_code >= 400:
-            body = ""
-            if not stream:
-                body = response.text[:1200].replace("\n", " ")
-            raise ArchiveError(
-                f"HTTP {response.status_code} bei {response.url}; "
-                f"Content-Type={response.headers.get('Content-Type')!r}; "
-                f"Antwort={body!r}"
-            )
-        return response
+            if response.status_code in self.RETRYABLE_STATUS and attempt + 1 < self.max_attempts:
+                status = response.status_code
+                retry_after = self._retry_after_seconds(response.headers.get("Retry-After"))
+                response.close()
+                pause = self.limiter.throttle(status, retry_after, attempt)
+                LOG.warning(
+                    "HTTP %s: globale Drosselung auf %.2f s; Pause %.1f s "
+                    "(Versuch %s/%s).",
+                    status, self.limiter.interval, pause, attempt + 1, self.max_attempts,
+                )
+                continue
+
+            if response.status_code >= 400:
+                body = ""
+                if not stream:
+                    body = response.text[:1200].replace("\\n", " ")
+                status = response.status_code
+                response.close()
+                raise ArchiveError(
+                    f"HTTP {status} bei {url}; Antwort={body!r}"
+                )
+            self.limiter.success()
+            return response
+
+        raise ArchiveError(f"Verbindungsfehler bei {url} nach {self.max_attempts} Versuchen: {last_error}")
 
     def close(self) -> None:
-        self.session.close()
+        with self.sessions_lock:
+            sessions, self.sessions = self.sessions, []
+        for session in sessions:
+            session.close()
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -688,6 +784,8 @@ def download_pending(
     client: RateLimitedSession,
     image_dir: Path,
     limit: int | None,
+    db_path: Path,
+    workers: int = 3,
 ) -> None:
     query = "SELECT * FROM posts WHERE downloaded=0 ORDER BY id DESC"
     if limit is not None:
@@ -700,6 +798,8 @@ def download_pending(
     free_bytes = shutil.disk_usage(image_dir).free
     LOG.info("Geschätzter Platzbedarf für diesen Lauf: %s", format_bytes(estimated_bytes))
     LOG.info("Freier Speicherplatz: %s", format_bytes(free_bytes))
+    LOG.info("Parallele Download-Worker: %s; gemeinsames Startintervall: %.2f s",
+             workers, client.limiter.interval)
     if unknown_sizes:
         LOG.warning("Für %s Posts fehlt die API-Dateigröße; die Schätzung ist unvollständig.", unknown_sizes)
     if estimated_bytes and free_bytes < estimated_bytes:
@@ -707,10 +807,62 @@ def download_pending(
             f"Zu wenig freier Speicherplatz: benötigt werden laut API mindestens "
             f"{format_bytes(estimated_bytes)}, frei sind {format_bytes(free_bytes)}."
         )
+
+    # Each worker owns its SQLite connection. HTTP sessions are also thread-local,
+    # while all workers share the same adaptive request limiter.
+    local = threading.local()
+    resources: list[tuple[sqlite3.Connection, int]] = []
+    resources_lock = threading.Lock()
+
+    def run_one(row: sqlite3.Row) -> bool:
+        worker_conn = getattr(local, "conn", None)
+        if worker_conn is None:
+            worker_conn = connect_db(db_path)
+            local.conn = worker_conn
+            with resources_lock:
+                resources.append((worker_conn, threading.get_ident()))
+        return download_one(worker_conn, client, row, image_dir)
+
     success = 0
-    for row in rows:
-        if download_one(conn, client, row, image_dir):
-            success += 1
+    completed = 0
+    row_iter = iter(rows)
+    max_in_flight = max(workers, workers * 2)
+    futures: set[concurrent.futures.Future[bool]] = set()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for _ in range(min(max_in_flight, len(rows))):
+                try:
+                    futures.add(executor.submit(run_one, next(row_iter)))
+                except StopIteration:
+                    break
+
+            while futures:
+                done, futures = concurrent.futures.wait(
+                    futures, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    if future.result():
+                        success += 1
+                    completed += 1
+                    if completed % 100 == 0 or completed == len(rows):
+                        LOG.info(
+                            "Fortschritt: %s/%s abgeschlossen; erfolgreich: %s; "
+                            "Request-Abstand aktuell: %.2f s",
+                            completed, len(rows), success, client.limiter.interval,
+                        )
+                    try:
+                        row = next(row_iter)
+                    except StopIteration:
+                        continue
+                    futures.add(executor.submit(run_one, row))
+    finally:
+        for worker_conn, _thread_id in resources:
+            try:
+                worker_conn.close()
+            except sqlite3.Error:
+                pass
+
     LOG.info("Downloads erfolgreich: %s von %s", success, len(rows))
 
 
@@ -761,6 +913,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download", action="store_true", help="Nach dem Metadaten-Scan alle noch fehlenden Originalbilder laden.")
     parser.add_argument("--download-only", action="store_true", help="Nur bereits erfasste, noch fehlende Originalbilder laden.")
     parser.add_argument("--download-limit", type=int, default=None, help="Maximale Anzahl Downloads in diesem Lauf.")
+    parser.add_argument("--workers", type=int, default=3, help="Parallele Download-Worker (Standard: 3).")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -775,6 +928,9 @@ def main() -> int:
     if args.download_limit is not None and args.download_limit < 1:
         LOG.error("--download-limit muss mindestens 1 sein.")
         return 2
+    if args.workers < 1 or args.workers > 8:
+        LOG.error("--workers muss zwischen 1 und 8 liegen.")
+        return 2
     if args.download and args.download_only:
         LOG.error("--download und --download-only können nicht gleichzeitig verwendet werden.")
         return 2
@@ -787,7 +943,7 @@ def main() -> int:
             scan_posts(conn, client, args.max_pages, args.restart_scan)
         if args.download or args.download_only:
             # A failed scan raises and prevents downloads from starting inadvertently.
-            download_pending(conn, client, args.image_dir, args.download_limit)
+            download_pending(conn, client, args.image_dir, args.download_limit, args.db, args.workers)
         print_summary(conn)
         return 0
     except KeyboardInterrupt:
