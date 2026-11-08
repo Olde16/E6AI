@@ -323,6 +323,15 @@ def connect_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_worker_db(path: Path) -> sqlite3.Connection:
+    """Open an already-migrated database without repeating schema setup."""
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
 def state_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
     row = conn.execute("SELECT value FROM scan_state WHERE key=?", (key,)).fetchone()
     return str(row["value"]) if row else default
@@ -817,7 +826,7 @@ def download_pending(
     def run_one(row: sqlite3.Row) -> bool:
         worker_conn = getattr(local, "conn", None)
         if worker_conn is None:
-            worker_conn = connect_db(db_path)
+            worker_conn = connect_worker_db(db_path)
             local.conn = worker_conn
             with resources_lock:
                 resources.append((worker_conn, threading.get_ident()))
