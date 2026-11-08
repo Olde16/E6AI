@@ -16,7 +16,6 @@ import argparse
 import getpass
 import logging
 import sqlite3
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -82,7 +81,8 @@ def import_favorites(
     api_key: str,
 ) -> int:
     ensure_favorites_table(conn)
-    sync_id = utc_now()
+    # Microseconds make this run marker unique even across quick repeated runs.
+    sync_id = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     page: str | None = None
     seen_ids: set[int] = set()
     total = 0
@@ -127,7 +127,6 @@ def import_favorites(
                 # Speichert vollständige Post-Metadaten und Tag-Kategorien
                 # in denselben Tabellen wie der reguläre Archiv-Scanner.
                 save_post(conn, post)
-                now = utc_now()
                 conn.execute("""
                     INSERT INTO favorites (
                         username, post_id, first_seen_at, last_seen_at, is_favorite
@@ -135,7 +134,7 @@ def import_favorites(
                     ON CONFLICT(username, post_id) DO UPDATE SET
                         last_seen_at=excluded.last_seen_at,
                         is_favorite=1
-                """, (username, post_id, now, now))
+                """, (username, post_id, utc_now(), sync_id))
 
         page_number += 1
         total += len(page_ids)
@@ -159,20 +158,6 @@ def import_favorites(
             "UPDATE favorites SET is_favorite=0 WHERE username=? AND last_seen_at != ?",
             (username, sync_id),
         )
-        # Zeitstempel können innerhalb derselben Sekunde identisch sein.
-        # Deshalb zusätzlich anhand der tatsächlich gelesenen IDs abgleichen.
-        if seen_ids:
-            placeholders = ",".join("?" for _ in seen_ids)
-            conn.execute(
-                f"UPDATE favorites SET is_favorite=0 "
-                f"WHERE username=? AND post_id NOT IN ({placeholders})",
-                (username, *sorted(seen_ids)),
-            )
-        else:
-            conn.execute(
-                "UPDATE favorites SET is_favorite=0 WHERE username=?",
-                (username,),
-            )
 
     active = conn.execute(
         "SELECT COUNT(*) FROM favorites WHERE username=? AND is_favorite=1",
