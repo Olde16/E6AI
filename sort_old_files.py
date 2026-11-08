@@ -2,7 +2,8 @@
 """Sort protected legacy files in TWS_AI_DB/old using SQLite metadata and MD5.
 
 Normal execution performs moves without an interactive confirmation.
-Use --dry-run for a preview. Files without a numeric post ID and destination
+Use --dry-run for a preview. Verified files belonging to deleted posts go to
+deleted/ for later manual sorting. Files without a numeric post ID and destination
 conflicts remain in old/; files that cannot be verified go to not_verified/.
 """
 
@@ -31,9 +32,11 @@ def safe_folder_name(value: str) -> str:
 def target_for_post(
     conn: sqlite3.Connection, root: Path, post_id: int
 ) -> tuple[Path | None, str | None]:
-    post = conn.execute("SELECT md5 FROM posts WHERE id=?", (post_id,)).fetchone()
+    post = conn.execute("SELECT md5, is_deleted FROM posts WHERE id=?", (post_id,)).fetchone()
     if post is None:
         return None, None
+    if bool(post["is_deleted"]):
+        return root / "deleted", post["md5"]
 
     rows = conn.execute(
         "SELECT category, tag_name FROM post_tags WHERE post_id=?",
@@ -130,7 +133,7 @@ def main() -> int:
             target_folder, expected_md5 = target_for_post(conn, root, post_id)
             if target_folder is not None and verify_md5(source, expected_md5):
                 destination = target_folder / source.name
-                reason = "MD5 stimmt"
+                reason = "gelöschter Beitrag (API-Flag deleted)" if target_folder == root / "deleted" else "MD5 stimmt"
             else:
                 destination = root / "not_verified" / source.name
                 if target_folder is None:
