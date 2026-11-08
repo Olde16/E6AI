@@ -71,7 +71,7 @@ def extract_posts(payload: Any) -> list[dict[str, Any]]:
 
     if not isinstance(posts, list):
         raise ArchiveError(
-            "Unerwartetes Antwortformat von /favorites.json; "
+            "Unerwartetes Antwortformat von /posts.json; "
             "erwartet wurde eine Liste oder ein Objekt mit 'posts'."
         )
     return [post for post in posts if isinstance(post, dict) and post.get("id") is not None]
