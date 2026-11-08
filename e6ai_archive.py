@@ -39,8 +39,8 @@ from urllib3.util.retry import Retry
 API_BASE = "https://e6ai.net"
 POSTS_ENDPOINT = f"{API_BASE}/posts.json"
 API_LIMIT = 320
-DEFAULT_DB = Path("archive/e6ai_archive.sqlite3")
 DEFAULT_IMAGE_DIR = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
+DEFAULT_DB = DEFAULT_IMAGE_DIR / "archive" / "e6ai_archive.sqlite3"
 DIRECTOR_TAG_CATEGORY = "director"
 CHARACTER_TAG_CATEGORY = "character"
 DEFAULT_USER_AGENT = "e6AI-Personal-Archive/1.0 (metadata and original-file archival)"
@@ -94,6 +94,7 @@ class RateLimitedSession:
         self.last_request = 0.0
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
+        stream = kwargs.pop("stream", False)
         elapsed = time.monotonic() - self.last_request
         if elapsed < REQUEST_INTERVAL:
             time.sleep(REQUEST_INTERVAL - elapsed)
@@ -102,7 +103,7 @@ class RateLimitedSession:
             response = self.session.get(
                 url,
                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                stream=kwargs.pop("stream", False),
+                stream=stream,
                 **kwargs,
             )
         except requests.RequestException as exc:
@@ -110,7 +111,7 @@ class RateLimitedSession:
 
         if response.status_code >= 400:
             body = ""
-            if not kwargs.get("stream", False):
+            if not stream:
                 body = response.text[:1200].replace("\n", " ")
             raise ArchiveError(
                 f"HTTP {response.status_code} bei {response.url}; "
@@ -150,6 +151,7 @@ def connect_db(path: Path) -> sqlite3.Connection:
         file_url        TEXT,
         local_path      TEXT,
         downloaded      INTEGER NOT NULL DEFAULT 0,
+        verification_status TEXT NOT NULL DEFAULT 'pending',
         download_error  TEXT,
         scanned_at      TEXT NOT NULL
     );
@@ -173,6 +175,19 @@ def connect_db(path: Path) -> sqlite3.Connection:
     CREATE INDEX IF NOT EXISTS idx_posts_downloaded ON posts(downloaded);
     CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags(tag_name);
     """)
+    # Backwards-compatible migrations for databases created by earlier versions.
+    post_columns = {row[1] for row in conn.execute("PRAGMA table_info(posts)")}
+    if "verification_status" not in post_columns:
+        conn.execute("ALTER TABLE posts ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'pending'")
+
+    tag_link_columns = {row[1] for row in conn.execute("PRAGMA table_info(post_tags)")}
+    if "category" not in tag_link_columns:
+        conn.execute("ALTER TABLE post_tags ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        conn.execute("""
+            UPDATE post_tags
+            SET category = COALESCE((SELECT category FROM tags WHERE tags.name = post_tags.tag_name), '')
+        """)
+
     conn.commit()
     return conn
 
@@ -257,6 +272,11 @@ def save_post(conn: sqlite3.Connection, post: dict[str, Any]) -> None:
                   OR posts.file_url IS NOT excluded.file_url
                 THEN 0 ELSE posts.downloaded
             END,
+            verification_status=CASE
+                WHEN posts.md5 IS NOT excluded.md5
+                  OR posts.file_url IS NOT excluded.file_url
+                THEN 'pending' ELSE posts.verification_status
+            END,
             local_path=CASE
                 WHEN posts.md5 IS NOT excluded.md5
                   OR posts.file_url IS NOT excluded.file_url
@@ -307,10 +327,10 @@ def save_post(conn: sqlite3.Connection, post: dict[str, Any]) -> None:
 
             conn.execute(
                 """
-                INSERT OR IGNORE INTO post_tags(post_id, tag_name)
-                VALUES (?, ?)
+                INSERT OR IGNORE INTO post_tags(post_id, tag_name, category)
+                VALUES (?, ?, ?)
                 """,
-                (post_id, name),
+                (post_id, name, category),
             )
 
 
@@ -472,19 +492,22 @@ def safe_folder_name(value: str) -> str:
 def post_folder(image_dir: Path, conn: sqlite3.Connection, post_id: int) -> Path:
     rows = conn.execute(
         """
-        SELECT t.category, t.name
-        FROM post_tags AS pt
-        JOIN tags AS t ON t.name = pt.tag_name
-        WHERE pt.post_id = ?
+        SELECT category, tag_name AS name
+        FROM post_tags
+        WHERE post_id = ?
         """,
         (post_id,),
     ).fetchall()
-    directors = sorted({r["name"] for r in rows if r["category"].casefold() == DIRECTOR_TAG_CATEGORY})
-    characters = sorted({r["name"] for r in rows if r["category"].casefold() == CHARACTER_TAG_CATEGORY})
+    directors = sorted({r["name"] for r in rows if str(r["category"]).casefold() == DIRECTOR_TAG_CATEGORY})
+    characters = sorted({r["name"] for r in rows if str(r["category"]).casefold() == CHARACTER_TAG_CATEGORY})
 
     director_folder = directors[0] if len(directors) == 1 else ("collabs" if len(directors) > 1 else "unknown")
     character_folder = characters[0] if len(characters) == 1 else ("multiple" if len(characters) > 1 else "unknown")
     return image_dir / safe_folder_name(director_folder) / safe_folder_name(character_folder)
+
+
+def not_verified_path(image_dir: Path, post_id: int, extension: str) -> Path:
+    return image_dir / "not_verified" / f"{post_id}.{extension}"
 
 
 def mark_download_error(conn: sqlite3.Connection, post_id: int, message: str) -> None:
@@ -503,39 +526,40 @@ def download_one(
 ) -> bool:
     post_id = int(row["id"])
     url = row["file_url"]
-    expected = row["md5"]
-    if not expected or not str(expected).strip():
-        mark_download_error(conn, post_id, "Keine MD5-Prüfsumme von der API; Download nicht als verifiziert übernommen.")
-        LOG.error("Post %s übersprungen: API liefert keine MD5-Prüfsumme.", post_id)
-        return False
+    expected = str(row["md5"] or "").strip()
     if not url:
-        mark_download_error(conn, post_id, "Keine file.url in API-Antwort")
+        mark_download_error(conn, post_id, "Keine file.url in API-Antwort; Originaldatei nicht abrufbar.")
         return False
     if not allowed_file_url(url):
-        mark_download_error(conn, post_id, "Datei-URL außerhalb der e6AI-Domain; aus Sicherheitsgründen ausgelassen")
+        mark_download_error(conn, post_id, "Datei-URL außerhalb der e6AI-Domain; aus Sicherheitsgründen ausgelassen.")
         LOG.warning("Post %s ausgelassen: Datei-URL liegt nicht auf e6AI.", post_id)
         return False
 
     ext = safe_extension(row["extension"])
-    destination_dir = post_folder(image_dir, conn, post_id)
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / f"{post_id}.{ext}"
-    temp_path = destination.with_suffix(destination.suffix + ".part")
+    is_expected_md5 = bool(expected)
+    verified_dir = post_folder(image_dir, conn, post_id)
+    unverified_destination = not_verified_path(image_dir, post_id, ext)
 
-    # Vorhandene Dateien bleiben an Ort und Stelle und werden nie überschrieben.
+    # A file without an API checksum cannot be called verified. Keep it separate.
+    destination_dir = verified_dir if is_expected_md5 else unverified_destination.parent
+    destination = (verified_dir / f"{post_id}.{ext}") if is_expected_md5 else unverified_destination
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    # Existing target files are never overwritten.
     if destination.exists():
-        if verify_md5(destination, expected):
+        if is_expected_md5 and verify_md5(destination, expected):
             with conn:
                 conn.execute(
-                    "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
+                    "UPDATE posts SET downloaded=1, verification_status='verified', local_path=?, download_error=NULL WHERE id=?",
                     (str(destination), post_id),
                 )
             LOG.info("Post %s bereits vorhanden und MD5-geprüft: %s", post_id, destination)
             return True
-        mark_download_error(conn, post_id, f"Zieldatei existiert bereits, MD5 stimmt aber nicht: {destination}; nicht überschrieben.")
-        LOG.error("Post %s: vorhandene Datei hat falsche MD5; nicht überschrieben.", post_id)
+        mark_download_error(conn, post_id, f"Zieldatei existiert bereits und kann nicht sicher übernommen werden: {destination}; nicht überschrieben.")
+        LOG.error("Post %s: Zieldatei existiert bereits; nicht überschrieben.", post_id)
         return False
 
+    temp_path = destination.with_name(destination.name + ".part")
     try:
         response = client.get(url, stream=True)
         digest = hashlib.md5()
@@ -549,20 +573,30 @@ def download_one(
             response.close()
 
         actual = digest.hexdigest()
-        if actual.lower() != str(expected).strip().lower():
-            raise ArchiveError(
-                f"MD5-Prüfung fehlgeschlagen (erwartet {expected}, erhalten {actual})"
-            )
-        # "xb" verhindert das Überschreiben einer vorhandenen temporären Datei.
-        # os.link legt das geprüfte Ergebnis ohne Überschreibsemantik am Ziel ab.
+        verified = is_expected_md5 and actual.lower() == expected.lower()
+        if verified:
+            destination = verified_dir / f"{post_id}.{ext}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            destination = unverified_destination
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not is_expected_md5:
+                reason = "API liefert keine MD5-Prüfsumme; Datei separat unter not_verified gespeichert."
+            else:
+                reason = f"MD5-Prüfung fehlgeschlagen (erwartet {expected}, erhalten {actual}); Datei separat unter not_verified gespeichert."
+
+        # Atomic no-overwrite placement; hard-link fails if the destination already exists.
         os.link(temp_path, destination)
         temp_path.unlink(missing_ok=True)
         with conn:
             conn.execute(
-                "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
-                (str(destination), post_id),
+                "UPDATE posts SET downloaded=1, verification_status=?, local_path=?, download_error=? WHERE id=?",
+                ("verified" if verified else "not_verified", str(destination), None if verified else reason, post_id),
             )
-        LOG.info("Post %s heruntergeladen und MD5-geprüft: %s", post_id, destination)
+        if verified:
+            LOG.info("Post %s heruntergeladen und MD5-geprüft: %s", post_id, destination)
+        else:
+            LOG.warning("Post %s gesichert, aber NICHT verifiziert: %s", post_id, destination)
         return True
     except Exception as exc:
         temp_path.unlink(missing_ok=True)
@@ -570,13 +604,14 @@ def download_one(
         LOG.error("Download für Post %s fehlgeschlagen: %s", post_id, exc)
         return False
 
+
 def download_pending(
     conn: sqlite3.Connection,
     client: RateLimitedSession,
     image_dir: Path,
     limit: int | None,
 ) -> None:
-    query = "SELECT * FROM posts ORDER BY id DESC"
+    query = "SELECT * FROM posts WHERE downloaded=0 ORDER BY id DESC"
     if limit is not None:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query).fetchall()
@@ -593,13 +628,17 @@ def print_summary(conn: sqlite3.Connection) -> None:
     tags = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
     links = conn.execute("SELECT COUNT(*) FROM post_tags").fetchone()[0]
     downloaded = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=1").fetchone()[0]
+    verified = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='verified'").fetchone()[0]
+    not_verified = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='not_verified'").fetchone()[0]
     pending = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=0").fetchone()[0]
     LOG.info("Datenbankübersicht:")
     LOG.info("  Beiträge: %s", posts)
     LOG.info("  Unterschiedliche Tags: %s", tags)
     LOG.info("  Post-Tag-Verknüpfungen: %s", links)
-    LOG.info("  Heruntergeladene Originaldateien: %s", downloaded)
-    LOG.info("  Noch nicht heruntergeladen: %s", pending)
+    LOG.info("  Gesicherte Originaldateien: %s", downloaded)
+    LOG.info("  MD5-verifiziert: %s", verified)
+    LOG.info("  Unter not_verified gesichert: %s", not_verified)
+    LOG.info("  Noch offen / fehlgeschlagen: %s", pending)
     LOG.info("  Scan-Cursor: %s", state_get(conn, "scan_cursor", "—") or "—")
     LOG.info("  Scan vollständig: %s", "ja" if state_get(conn, "scan_complete") == "1" else "nein")
 
