@@ -107,6 +107,7 @@ def main() -> int:
         parser.error(f"SQLite-Datenbank nicht gefunden: {db_path}")
 
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(post_tags)")}
         if "category" not in columns:
