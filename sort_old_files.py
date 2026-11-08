@@ -73,7 +73,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Vorsortierung des Altbestands anhand der e6AI-SQLite-Datenbank.")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="Archiv-Stammverzeichnis.")
     parser.add_argument("--db", type=Path, default=None, help="SQLite-Datei; Standard: <root>/archive/e6ai_archive.sqlite3")
-    parser.add_argument("--apply", action="store_true", help="Verschiebt Dateien tatsächlich. Ohne diese Option nur Vorschau.")
+    parser.add_argument("--dry-run", action="store_true", help="Nur Vorschau anzeigen; keine Dateien verschieben.")
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -113,17 +113,17 @@ def main() -> int:
                 conflicts += 1
                 continue
 
-            print(f"{'VERSCHIEBE' if args.apply else 'VORSCHAU'}: {source} -> {destination}")
-            if args.apply:
+            print(f"{'VORSCHAU' if args.dry_run else 'VERSCHIEBE'}: {source} -> {destination}")
+            if not args.dry_run:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 # Hard-link creation is atomic and refuses to overwrite an existing target.
                 move_without_overwrite(source, destination)
             moved += 1
 
         print()
-        print(f"Fertig. {'Verschoben' if args.apply else 'Vorschau'}: {moved}; übersprungen: {skipped}; Konflikte: {conflicts}.")
-        if not args.apply:
-            print("Es wurde nichts verändert. Zum tatsächlichen Verschieben --apply angeben.")
+        print(f"Fertig. {'Vorschau' if args.dry_run else 'Verschoben'}: {moved}; übersprungen: {skipped}; Konflikte: {conflicts}.")
+        if args.dry_run:
+            print("Es wurde nichts verändert. Ohne --dry-run werden die Dateien verschoben.")
         return 0
     finally:
         conn.close()
