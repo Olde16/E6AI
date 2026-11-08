@@ -51,7 +51,12 @@ def move_without_overwrite(source: Path, destination: Path) -> None:
     except OSError as exc:
         if exc.errno == errno.EEXIST:
             raise
-        if exc.errno != errno.EXDEV:
+        fallback_errors = {errno.EXDEV, errno.EPERM, errno.EACCES}
+        if hasattr(errno, "ENOTSUP"):
+            fallback_errors.add(errno.ENOTSUP)
+        if hasattr(errno, "EOPNOTSUPP"):
+            fallback_errors.add(errno.EOPNOTSUPP)
+        if exc.errno not in fallback_errors:
             raise
 
     temp = destination.with_name(destination.name + ".moving.part")
