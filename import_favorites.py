@@ -130,9 +130,24 @@ def import_favorites(
                 seen_ids.add(post_id)
                 page_ids.append(post_id)
 
-                # Speichert vollständige Post-Metadaten und Tag-Kategorien
-                # in denselben Tabellen wie der reguläre Archiv-Scanner.
-                save_post(conn, post)
+                # Bereits archivierte Posts mit identischer change_seq sind
+                # unverändert. Dann sparen wir das erneute Schreiben aller
+                # Metadaten und das Löschen/Neuanlegen sämtlicher Tags.
+                incoming_seq = post.get("change_seq")
+                existing = conn.execute(
+                    "SELECT change_seq FROM posts WHERE id=?",
+                    (post_id,),
+                ).fetchone()
+                unchanged = (
+                    existing is not None
+                    and incoming_seq is not None
+                    and existing[0] is not None
+                    and str(existing[0]) == str(incoming_seq)
+                )
+                if not unchanged:
+                    # Neue oder geänderte Posts vollständig übernehmen.
+                    save_post(conn, post)
+
                 conn.execute("""
                     INSERT INTO favorites (
                         username, post_id, first_seen_at, last_seen_at, is_favorite
