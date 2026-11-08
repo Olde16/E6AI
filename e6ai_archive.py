@@ -8,8 +8,8 @@ e6AI personal archive
 API behavior follows the supplied e6AI API documentation:
   GET /posts.json, limit <= 320
   first page without `page`; subsequent pages with page=b<lowest post ID>
-  custom non-empty User-Agent; adaptive shared limiter targets ~1 request/second,
-  with a 0.9-second floor and global backoff on throttling responses.
+  custom non-empty User-Agent; adaptive shared limiter starts at 0.8 seconds,
+  and increases the interval only after HTTP throttling responses.
 
 Examples:
   python e6ai_archive.py --max-pages 3
@@ -52,8 +52,8 @@ DEFAULT_DB = Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3
 DIRECTOR_TAG_CATEGORIES = {"director", "artist"}
 CHARACTER_TAG_CATEGORY = "character"
 DEFAULT_USER_AGENT = "e6AI-Personal-Archive/1.0 (metadata and original-file archival)"
-MIN_REQUEST_INTERVAL = 0.9
-INITIAL_REQUEST_INTERVAL = 1.0
+MIN_REQUEST_INTERVAL = 0.8
+INITIAL_REQUEST_INTERVAL = 0.8
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 60
 CHUNK_SIZE = 1024 * 1024
@@ -106,6 +106,7 @@ class AdaptiveRateLimiter:
                 self.throttle_count = 0
 
     def throttle(self, status: int, retry_after: float | None, attempt: int) -> float:
+        """Erhöht den Request-Abstand ausschließlich bei HTTP-Drosselung."""
         with self.lock:
             self.success_streak = 0
             self.throttle_count += 1
@@ -114,12 +115,18 @@ class AdaptiveRateLimiter:
                 pause = max(0.0, retry_after)
             elif status == 421:
                 pause = min(300.0, 60.0 * (2 ** min(attempt, 2)))
-            elif status in (429, 503):
-                pause = min(180.0, 10.0 * (2 ** min(attempt, 4)))
             else:
-                pause = min(60.0, 2.0 * (2 ** min(attempt, 4)))
+                pause = min(180.0, 10.0 * (2 ** min(attempt, 4)))
             self.cooldown_until = max(self.cooldown_until, time.monotonic() + pause)
             return pause
+
+    def transient_error(self, attempt: int) -> float:
+        """Kurze gemeinsame Pause bei Netzwerkfehlern, ohne den Takt dauerhaft anzuheben."""
+        pause = min(30.0, 2.0 * (2 ** min(attempt, 4)))
+        with self.lock:
+            self.success_streak = 0
+            self.cooldown_until = max(self.cooldown_until, time.monotonic() + pause)
+        return pause
 
 
 class RateLimitedSession:
@@ -188,9 +195,15 @@ class RateLimitedSession:
                 )
             except requests.RequestException as exc:
                 last_error = exc
+                pause = self.limiter.transient_error(attempt)
+                LOG.warning(
+                    "Netzwerkfehler bei %s (%s: %s), Versuch %s/%s; "
+                    "gemeinsame Pause %.1f s, Request-Abstand bleibt %.2f s.",
+                    url, type(exc).__name__, exc, attempt + 1, self.max_attempts,
+                    pause, self.limiter.interval,
+                )
                 if attempt + 1 >= self.max_attempts:
                     break
-                self.limiter.throttle(0, None, attempt)
                 continue
 
             if response.status_code in self.RETRYABLE_STATUS and attempt + 1 < self.max_attempts:
@@ -680,12 +693,21 @@ def move_file_no_overwrite(source: Path, destination: Path) -> None:
     source.unlink()
 
 
-def mark_download_error(conn: sqlite3.Connection, post_id: int, message: str) -> None:
+def mark_download_error(
+    conn: sqlite3.Connection, post_id: int, message: str,
+    verification_status: str | None = None,
+) -> None:
     with conn:
-        conn.execute(
-            "UPDATE posts SET downloaded=0, download_error=? WHERE id=?",
-            (message[:2000], post_id),
-        )
+        if verification_status:
+            conn.execute(
+                "UPDATE posts SET downloaded=0, verification_status=?, download_error=? WHERE id=?",
+                (verification_status, message[:2000], post_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE posts SET downloaded=0, download_error=? WHERE id=?",
+                (message[:2000], post_id),
+            )
 
 
 def download_one(
@@ -698,7 +720,11 @@ def download_one(
     url = row["file_url"]
     expected = str(row["md5"] or "").strip()
     if not url:
-        mark_download_error(conn, post_id, "Keine file.url in API-Antwort; Originaldatei nicht abrufbar.")
+        mark_download_error(
+            conn, post_id,
+            "Keine file.url in API-Antwort; Originaldatei nicht abrufbar.",
+            verification_status="unavailable",
+        )
         return False
     if not allowed_file_url(url):
         mark_download_error(conn, post_id, "Datei-URL außerhalb der e6AI-Domain; aus Sicherheitsgründen ausgelassen.")
@@ -798,7 +824,22 @@ def download_pending(
     db_path: Path,
     workers: int = 3,
 ) -> None:
-    query = "SELECT * FROM posts WHERE downloaded=0 ORDER BY id DESC"
+    # Posts ohne Original-URL sind terminal nicht abrufbar und sollen nicht
+    # bei jedem Lauf erneut als Download-Aufgabe eingeplant werden.
+    with conn:
+        conn.execute("""
+            UPDATE posts
+            SET verification_status='unavailable',
+                download_error='Keine file.url in API-Antwort; Originaldatei nicht abrufbar.'
+            WHERE downloaded=0 AND (file_url IS NULL OR TRIM(file_url)='')
+              AND verification_status != 'unavailable'
+        """)
+    query = """
+        SELECT * FROM posts
+        WHERE downloaded=0 AND file_url IS NOT NULL AND TRIM(file_url) != ''
+          AND verification_status != 'unavailable'
+        ORDER BY id DESC
+    """
     if limit is not None:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query).fetchall()
@@ -893,10 +934,11 @@ def print_summary(conn: sqlite3.Connection) -> None:
     downloaded = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=1").fetchone()[0]
     verified = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='verified'").fetchone()[0]
     not_verified = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='not_verified'").fetchone()[0]
-    pending = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=0").fetchone()[0]
+    unavailable = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='unavailable'").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=0 AND verification_status!='unavailable'").fetchone()[0]
     total_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts").fetchone()[0]
     downloaded_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts WHERE downloaded=1").fetchone()[0]
-    pending_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts WHERE downloaded=0").fetchone()[0]
+    pending_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts WHERE downloaded=0 AND verification_status!='unavailable'").fetchone()[0]
     LOG.info("Datenbankübersicht:")
     LOG.info("  Beiträge: %s", posts)
     LOG.info("  Unterschiedliche Tags: %s", tags)
@@ -904,6 +946,7 @@ def print_summary(conn: sqlite3.Connection) -> None:
     LOG.info("  Gesicherte Originaldateien: %s", downloaded)
     LOG.info("  MD5-verifiziert: %s", verified)
     LOG.info("  Unter not_verified gesichert: %s", not_verified)
+    LOG.info("  Ohne abrufbare Datei-URL: %s", unavailable)
     LOG.info("  Noch offen / fehlgeschlagen: %s", pending)
     LOG.info("  Geschätzte Gesamtgröße: %s", format_bytes(total_bytes))
     LOG.info("  Geschätzte gesicherte Größe: %s", format_bytes(downloaded_bytes))
