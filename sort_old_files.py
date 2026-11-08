@@ -100,7 +100,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Vorsortierung des Altbestands anhand der e6AI-SQLite-Datenbank.")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="Archiv-Stammverzeichnis.")
     parser.add_argument("--db", type=Path, default=None, help="SQLite-Datei; Standard: archive/e6ai_archive.sqlite3 neben diesem Skript")
-    parser.add_argument("--dry-run", action="store_true", help="Nur Vorschau anzeigen; keine Dateien verschieben.")
+    parser.add_argument("--dry-run", action="store_true", help="Nur Vorschau anzeigen; keine Dateien verschieben oder herunterladen.")
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -160,23 +160,19 @@ def main() -> int:
                                 (post_id,),
                             ).fetchone()
                             if refreshed and refreshed["verification_status"] == "verified" and refreshed["local_path"]:
-                                fresh_path = Path(refreshed["local_path"])
-                                retried += 1
-                                print(f"Erneut heruntergeladen und MD5-verifiziert: {fresh_path}", flush=True)
+                                candidate = Path(refreshed["local_path"])
+                                if candidate.is_file() and verify_md5(candidate, expected_md5):
+                                    fresh_path = candidate
+                                    retried += 1
+                                    print(f"Erneut heruntergeladen und MD5-verifiziert: {fresh_path}", flush=True)
                         elif row is None or not row["file_url"]:
                             print(f"Kein erneuter Download möglich: file.url fehlt für Post {post_id}.", flush=True)
 
                 if fresh_path is not None:
-                    # Preserve the corrupt legacy copy for manual inspection.
-                    destination = root / "not_verified" / source.name
-                    if destination.exists():
-                        print(f"KONFLIKT (not_verified-Ziel existiert; Quelle bleibt in old): {source}")
-                        conflicts += 1
-                        continue
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    move_without_overwrite(source, destination)
-
-                    # Deleted posts are kept together for later manual sorting.
+                    # The verified replacement is now in the archive. Remove the
+                    # corrupt legacy copy so that the post exists only once.
+                    source.unlink()
+                    print(f"Alte fehlerhafte Datei durch verifizierten Download ersetzt: Post {post_id}", flush=True)
                     if target_folder == root / "deleted":
                         deleted_destination = root / "deleted" / fresh_path.name
                         if fresh_path != deleted_destination:
