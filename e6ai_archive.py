@@ -183,6 +183,14 @@ def connect_db(path: Path) -> sqlite3.Connection:
     post_columns = {row[1] for row in conn.execute("PRAGMA table_info(posts)")}
     if "verification_status" not in post_columns:
         conn.execute("ALTER TABLE posts ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'pending'")
+        # Earlier versions treated a missing MD5 as successful verification.
+        # Recheck every old "downloaded" record against the new safe destination;
+        # existing files are preserved and reused only after an actual MD5 match.
+        conn.execute("""
+            UPDATE posts
+            SET downloaded=0, verification_status='pending',
+                local_path=NULL, download_error=NULL
+        """)
 
     tag_link_info = list(conn.execute("PRAGMA table_info(post_tags)"))
     tag_link_columns = {row[1] for row in tag_link_info}
