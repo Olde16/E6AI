@@ -111,7 +111,10 @@ def main() -> int:
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(post_tags)")}
         if "category" not in columns:
-            parser.error("Die Datenbank hat noch keine Kategorie pro Post-Tag-Verknüpfung. Bitte zuerst e6ai_archive.py aktualisieren/ausführen.")
+            parser.error("Die Datenbank hat noch keine Kategorie pro Post-Tag-Verknüpfung. Bitte zuerst e6ai_archive.py ausführen.")
+        scan_state = conn.execute("SELECT value FROM scan_state WHERE key='scan_complete'").fetchone()
+        if scan_state is None or scan_state[0] != "1":
+            parser.error("Der Metadaten-Scan ist noch nicht vollständig. Erst e6ai_archive.py ohne --max-pages vollständig laufen lassen.")
 
         moved = 0
         skipped = 0
