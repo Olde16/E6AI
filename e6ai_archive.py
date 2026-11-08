@@ -40,7 +40,9 @@ API_BASE = "https://e6ai.net"
 POSTS_ENDPOINT = f"{API_BASE}/posts.json"
 API_LIMIT = 320
 DEFAULT_DB = Path("archive/e6ai_archive.sqlite3")
-DEFAULT_IMAGE_DIR = Path("archive/images")
+DEFAULT_IMAGE_DIR = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
+DIRECTOR_TAG_CATEGORY = "director"
+CHARACTER_TAG_CATEGORY = "character"
 DEFAULT_USER_AGENT = "e6AI-Personal-Archive/1.0 (metadata and original-file archival)"
 REQUEST_INTERVAL = 1.15
 CONNECT_TIMEOUT = 15
@@ -449,13 +451,48 @@ def allowed_file_url(url: str) -> bool:
 
 
 def verify_md5(path: Path, expected: str | None) -> bool:
-    if not expected:
-        return True
+    # Ohne API-Prüfsumme lässt sich eine Datei nicht zuverlässig verifizieren.
+    if not expected or not str(expected).strip():
+        return False
     digest = hashlib.md5()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(CHUNK_SIZE), b""):
             digest.update(chunk)
-    return digest.hexdigest().lower() == expected.lower()
+    return digest.hexdigest().lower() == str(expected).strip().lower()
+
+
+def safe_folder_name(value: str) -> str:
+    """Turn a tag into one safe path component."""
+    cleaned = value.strip().replace("/", "_").replace("\\", "_")
+    cleaned = "".join("_" if ord(ch) < 32 or ch in '<>:"|?*' else ch for ch in cleaned)
+    cleaned = cleaned.strip(" .")
+    return cleaned if cleaned and cleaned not in {".", ".."} else "unknown"
+
+
+def post_folder(image_dir: Path, conn: sqlite3.Connection, post_id: int) -> Path:
+    rows = conn.execute(
+        """
+        SELECT t.category, t.name
+        FROM post_tags AS pt
+        JOIN tags AS t ON t.name = pt.tag_name
+        WHERE pt.post_id = ?
+        """,
+        (post_id,),
+    ).fetchall()
+    directors = sorted({r["name"] for r in rows if r["category"].casefold() == DIRECTOR_TAG_CATEGORY})
+    characters = sorted({r["name"] for r in rows if r["category"].casefold() == CHARACTER_TAG_CATEGORY})
+
+    director_folder = directors[0] if len(directors) == 1 else ("collabs" if len(directors) > 1 else "unknown")
+    character_folder = characters[0] if len(characters) == 1 else ("multiple" if len(characters) > 1 else "unknown")
+    return image_dir / safe_folder_name(director_folder) / safe_folder_name(character_folder)
+
+
+def mark_download_error(conn: sqlite3.Connection, post_id: int, message: str) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE posts SET downloaded=0, download_error=? WHERE id=?",
+            (message[:2000], post_id),
+        )
 
 
 def download_one(
@@ -466,68 +503,72 @@ def download_one(
 ) -> bool:
     post_id = int(row["id"])
     url = row["file_url"]
+    expected = row["md5"]
+    if not expected or not str(expected).strip():
+        mark_download_error(conn, post_id, "Keine MD5-Prüfsumme von der API; Download nicht als verifiziert übernommen.")
+        LOG.error("Post %s übersprungen: API liefert keine MD5-Prüfsumme.", post_id)
+        return False
     if not url:
-        with conn:
-            conn.execute(
-                "UPDATE posts SET download_error=? WHERE id=?",
-                ("Keine file.url in API-Antwort", post_id),
-            )
+        mark_download_error(conn, post_id, "Keine file.url in API-Antwort")
         return False
     if not allowed_file_url(url):
-        with conn:
-            conn.execute(
-                "UPDATE posts SET download_error=? WHERE id=?",
-                ("Datei-URL außerhalb der e6AI-Domain; aus Sicherheitsgründen ausgelassen", post_id),
-            )
+        mark_download_error(conn, post_id, "Datei-URL außerhalb der e6AI-Domain; aus Sicherheitsgründen ausgelassen")
         LOG.warning("Post %s ausgelassen: Datei-URL liegt nicht auf e6AI.", post_id)
         return False
 
     ext = safe_extension(row["extension"])
-    image_dir.mkdir(parents=True, exist_ok=True)
-    destination = image_dir / f"{post_id}.{ext}"
+    destination_dir = post_folder(image_dir, conn, post_id)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / f"{post_id}.{ext}"
     temp_path = destination.with_suffix(destination.suffix + ".part")
 
-    if destination.exists() and verify_md5(destination, row["md5"]):
-        with conn:
-            conn.execute(
-                "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
-                (str(destination), post_id),
-            )
-        return True
+    # Vorhandene Dateien bleiben an Ort und Stelle und werden nie überschrieben.
+    if destination.exists():
+        if verify_md5(destination, expected):
+            with conn:
+                conn.execute(
+                    "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
+                    (str(destination), post_id),
+                )
+            LOG.info("Post %s bereits vorhanden und MD5-geprüft: %s", post_id, destination)
+            return True
+        mark_download_error(conn, post_id, f"Zieldatei existiert bereits, MD5 stimmt aber nicht: {destination}; nicht überschrieben.")
+        LOG.error("Post %s: vorhandene Datei hat falsche MD5; nicht überschrieben.", post_id)
+        return False
 
     try:
         response = client.get(url, stream=True)
         digest = hashlib.md5()
-        with temp_path.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    handle.write(chunk)
-                    digest.update(chunk)
-        expected = row["md5"]
+        try:
+            with temp_path.open("xb") as handle:
+                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        handle.write(chunk)
+                        digest.update(chunk)
+        finally:
+            response.close()
+
         actual = digest.hexdigest()
-        if expected and actual.lower() != str(expected).lower():
-            temp_path.unlink(missing_ok=True)
+        if actual.lower() != str(expected).strip().lower():
             raise ArchiveError(
                 f"MD5-Prüfung fehlgeschlagen (erwartet {expected}, erhalten {actual})"
             )
-        os.replace(temp_path, destination)
+        # "xb" verhindert das Überschreiben einer vorhandenen temporären Datei.
+        # os.link legt das geprüfte Ergebnis ohne Überschreibsemantik am Ziel ab.
+        os.link(temp_path, destination)
+        temp_path.unlink(missing_ok=True)
         with conn:
             conn.execute(
                 "UPDATE posts SET downloaded=1, local_path=?, download_error=NULL WHERE id=?",
                 (str(destination), post_id),
             )
-        LOG.info("Post %s heruntergeladen: %s", post_id, destination)
+        LOG.info("Post %s heruntergeladen und MD5-geprüft: %s", post_id, destination)
         return True
     except Exception as exc:
         temp_path.unlink(missing_ok=True)
-        with conn:
-            conn.execute(
-                "UPDATE posts SET downloaded=0, download_error=? WHERE id=?",
-                (str(exc)[:2000], post_id),
-            )
+        mark_download_error(conn, post_id, str(exc))
         LOG.error("Download für Post %s fehlgeschlagen: %s", post_id, exc)
         return False
-
 
 def download_pending(
     conn: sqlite3.Connection,
