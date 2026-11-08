@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sqlite3
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -590,6 +591,11 @@ def download_one(
                 unverified_destination.parent.mkdir(parents=True, exist_ok=True)
                 os.link(destination, unverified_destination)
                 destination.unlink()
+                with conn:
+                    conn.execute(
+                        "UPDATE posts SET verification_status='not_verified', local_path=? WHERE id=?",
+                        (str(unverified_destination), post_id),
+                    )
             except OSError as exc:
                 mark_download_error(conn, post_id, f"Vorhandene Datei nicht verifizierbar und konnte nicht sicher nach not_verified verschoben werden: {exc}")
                 return False
@@ -655,11 +661,33 @@ def download_pending(
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query).fetchall()
     LOG.info("Noch herunterzuladende Dateien: %s", len(rows))
+    estimated_bytes = sum(max(0, int(row["file_size"] or 0)) for row in rows)
+    unknown_sizes = sum(1 for row in rows if row["file_size"] is None)
+    image_dir.mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(image_dir).free
+    LOG.info("Geschätzter Platzbedarf für diesen Lauf: %s", format_bytes(estimated_bytes))
+    LOG.info("Freier Speicherplatz: %s", format_bytes(free_bytes))
+    if unknown_sizes:
+        LOG.warning("Für %s Posts fehlt die API-Dateigröße; die Schätzung ist unvollständig.", unknown_sizes)
+    if estimated_bytes and free_bytes < estimated_bytes:
+        raise ArchiveError(
+            f"Zu wenig freier Speicherplatz: benötigt werden laut API mindestens "
+            f"{format_bytes(estimated_bytes)}, frei sind {format_bytes(free_bytes)}."
+        )
     success = 0
     for row in rows:
         if download_one(conn, client, row, image_dir):
             success += 1
     LOG.info("Downloads erfolgreich: %s von %s", success, len(rows))
+
+
+def format_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{amount:.2f} {unit}"
+        amount /= 1024
+    return f"{amount:.2f} TiB"
 
 
 def print_summary(conn: sqlite3.Connection) -> None:
@@ -670,6 +698,9 @@ def print_summary(conn: sqlite3.Connection) -> None:
     verified = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='verified'").fetchone()[0]
     not_verified = conn.execute("SELECT COUNT(*) FROM posts WHERE verification_status='not_verified'").fetchone()[0]
     pending = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded=0").fetchone()[0]
+    total_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts").fetchone()[0]
+    downloaded_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts WHERE downloaded=1").fetchone()[0]
+    pending_bytes = conn.execute("SELECT COALESCE(SUM(file_size),0) FROM posts WHERE downloaded=0").fetchone()[0]
     LOG.info("Datenbankübersicht:")
     LOG.info("  Beiträge: %s", posts)
     LOG.info("  Unterschiedliche Tags: %s", tags)
@@ -678,6 +709,9 @@ def print_summary(conn: sqlite3.Connection) -> None:
     LOG.info("  MD5-verifiziert: %s", verified)
     LOG.info("  Unter not_verified gesichert: %s", not_verified)
     LOG.info("  Noch offen / fehlgeschlagen: %s", pending)
+    LOG.info("  Geschätzte Gesamtgröße: %s", format_bytes(total_bytes))
+    LOG.info("  Geschätzte gesicherte Größe: %s", format_bytes(downloaded_bytes))
+    LOG.info("  Geschätzte offene Größe: %s", format_bytes(pending_bytes))
     LOG.info("  Scan-Cursor: %s", state_get(conn, "scan_cursor", "—") or "—")
     LOG.info("  Scan vollständig: %s", "ja" if state_get(conn, "scan_complete") == "1" else "nein")
 
