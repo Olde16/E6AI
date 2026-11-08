@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -27,19 +28,35 @@ def safe_folder_name(value: str) -> str:
     return cleaned if cleaned and cleaned not in {".", ".."} else "unknown"
 
 
-def target_for_post(conn: sqlite3.Connection, root: Path, post_id: int) -> Path | None:
+def target_for_post(
+    conn: sqlite3.Connection, root: Path, post_id: int
+) -> tuple[Path | None, str | None]:
+    post = conn.execute("SELECT md5 FROM posts WHERE id=?", (post_id,)).fetchone()
+    if post is None:
+        return None, None
+
     rows = conn.execute(
         "SELECT category, tag_name FROM post_tags WHERE post_id=?",
         (post_id,),
     ).fetchall()
-    if not rows:
-        return None
-
     directors = sorted({name for category, name in rows if str(category).casefold() in DIRECTOR_CATEGORIES})
     characters = sorted({name for category, name in rows if str(category).casefold() == CHARACTER_CATEGORY})
     director = directors[0] if len(directors) == 1 else ("collabs" if len(directors) > 1 else "unknown")
     character = characters[0] if len(characters) == 1 else ("multiple" if len(characters) > 1 else "unknown")
-    return root / safe_folder_name(director) / safe_folder_name(character)
+    return root / safe_folder_name(director) / safe_folder_name(character), post["md5"]
+
+
+def verify_md5(path: Path, expected: str | None) -> bool:
+    if not expected or not str(expected).strip():
+        return False
+    digest = hashlib.md5()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest().lower() == str(expected).strip().lower()
 
 
 def move_without_overwrite(source: Path, destination: Path) -> None:
@@ -106,19 +123,25 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            target_folder = target_for_post(conn, root, post_id)
-            if target_folder is None:
-                print(f"NICHT ZUORDENBAR (keine Tags/kein DB-Eintrag): {source}")
-                skipped += 1
-                continue
+            target_folder, expected_md5 = target_for_post(conn, root, post_id)
+            if target_folder is not None and verify_md5(source, expected_md5):
+                destination = target_folder / source.name
+                reason = "MD5 stimmt"
+            else:
+                destination = root / "not_verified" / source.name
+                if target_folder is None:
+                    reason = "kein Post-Eintrag in SQLite"
+                elif not expected_md5:
+                    reason = "MD5 fehlt in SQLite"
+                else:
+                    reason = "MD5 stimmt nicht"
 
-            destination = target_folder / source.name
             if destination.exists():
-                print(f"KONFLIKT (Ziel existiert; Quelle bleibt in old): {source} -> {destination}")
+                print(f"KONFLIKT ({reason}; Ziel existiert; Quelle bleibt in old): {source} -> {destination}")
                 conflicts += 1
                 continue
 
-            print(f"{'VORSCHAU' if args.dry_run else 'VERSCHIEBE'}: {source} -> {destination}")
+            print(f"{'VORSCHAU' if args.dry_run else 'VERSCHIEBE'} ({reason}): {source} -> {destination}")
             if not args.dry_run:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 # Hard-link creation is atomic and refuses to overwrite an existing target.
