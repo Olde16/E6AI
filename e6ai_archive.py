@@ -41,7 +41,9 @@ POSTS_ENDPOINT = f"{API_BASE}/posts.json"
 API_LIMIT = 320
 DEFAULT_IMAGE_DIR = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
 DEFAULT_DB = DEFAULT_IMAGE_DIR / "archive" / "e6ai_archive.sqlite3"
-DIRECTOR_TAG_CATEGORY = "director"
+# e6AI/e621-style APIs commonly call the creator category "artist";
+# accept "director" as well for APIs that expose that label directly.
+DIRECTOR_TAG_CATEGORIES = {"director", "artist"}
 CHARACTER_TAG_CATEGORY = "character"
 DEFAULT_USER_AGENT = "e6AI-Personal-Archive/1.0 (metadata and original-file archival)"
 REQUEST_INTERVAL = 1.15
@@ -181,13 +183,35 @@ def connect_db(path: Path) -> sqlite3.Connection:
     if "verification_status" not in post_columns:
         conn.execute("ALTER TABLE posts ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'pending'")
 
-    tag_link_columns = {row[1] for row in conn.execute("PRAGMA table_info(post_tags)")}
+    tag_link_info = list(conn.execute("PRAGMA table_info(post_tags)"))
+    tag_link_columns = {row[1] for row in tag_link_info}
     if "category" not in tag_link_columns:
         conn.execute("ALTER TABLE post_tags ADD COLUMN category TEXT NOT NULL DEFAULT ''")
         conn.execute("""
             UPDATE post_tags
             SET category = COALESCE((SELECT category FROM tags WHERE tags.name = post_tags.tag_name), '')
         """)
+
+    # Rebuild legacy (post_id, tag_name) keys so identical tag names in
+    # different categories can coexist for the same post.
+    primary_key_columns = [row[1] for row in sorted(tag_link_info, key=lambda item: item[5]) if row[5]]
+    if primary_key_columns != ["post_id", "tag_name", "category"]:
+        conn.execute("DROP INDEX IF EXISTS idx_post_tags_tag")
+        conn.execute("ALTER TABLE post_tags RENAME TO post_tags_legacy")
+        conn.execute("""
+            CREATE TABLE post_tags (
+                post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                tag_name TEXT NOT NULL REFERENCES tags(name),
+                category TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (post_id, tag_name, category)
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO post_tags(post_id, tag_name, category)
+            SELECT post_id, tag_name, category FROM post_tags_legacy
+        """)
+        conn.execute("DROP TABLE post_tags_legacy")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags(tag_name)")
 
     conn.commit()
     return conn
@@ -502,7 +526,7 @@ def post_folder(image_dir: Path, conn: sqlite3.Connection, post_id: int) -> Path
         """,
         (post_id,),
     ).fetchall()
-    directors = sorted({r["name"] for r in rows if str(r["category"]).casefold() == DIRECTOR_TAG_CATEGORY})
+    directors = sorted({r["name"] for r in rows if str(r["category"]).casefold() in DIRECTOR_TAG_CATEGORIES})
     characters = sorted({r["name"] for r in rows if str(r["category"]).casefold() == CHARACTER_TAG_CATEGORY})
 
     director_folder = directors[0] if len(directors) == 1 else ("collabs" if len(directors) > 1 else "unknown")
@@ -563,6 +587,7 @@ def download_one(
             # Preserve a pre-existing corrupt/unverifiable target separately, then
             # fetch a fresh copy. Both operations are no-overwrite hard-link moves.
             try:
+                unverified_destination.parent.mkdir(parents=True, exist_ok=True)
                 os.link(destination, unverified_destination)
                 destination.unlink()
             except OSError as exc:
