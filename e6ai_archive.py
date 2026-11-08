@@ -576,7 +576,7 @@ def download_pending(
     image_dir: Path,
     limit: int | None,
 ) -> None:
-    query = "SELECT * FROM posts WHERE downloaded=0 ORDER BY id DESC"
+    query = "SELECT * FROM posts ORDER BY id DESC"
     if limit is not None:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query).fetchall()
