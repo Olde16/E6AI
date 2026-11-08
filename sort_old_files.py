@@ -125,15 +125,16 @@ def main() -> int:
         print(f"Durchsuche Altbestand: {old_dir}", flush=True)
         file_count = 0
         for dirpath, dirnames, filenames in os.walk(old_dir):
-                dirnames.sort()
-                filenames.sort()
-                for filename in filenames:
-                    source = Path(dirpath) / filename
-                    if not source.is_file():
-                        continue
-                    file_count += 1
-                    if file_count == 1 or file_count % 1000 == 0:
-                        print(f"Gefundene Dateien: {file_count}", flush=True)
+            dirnames.sort()
+            filenames.sort()
+            for filename in filenames:
+                source = Path(dirpath) / filename
+                if not source.is_file():
+                    continue
+                file_count += 1
+                if file_count == 1 or file_count % 1000 == 0:
+                    print(f"Gefundene Dateien: {file_count}", flush=True)
+
                 try:
                     post_id = int(source.stem)
                 except ValueError:
@@ -165,7 +166,6 @@ def main() -> int:
                     # Hard-link creation is atomic and refuses to overwrite an existing target.
                     move_without_overwrite(source, destination)
                 moved += 1
-
         print()
         print(f"Fertig. {'Vorschau' if args.dry_run else 'Verschoben'}: {moved}; übersprungen: {skipped}; Konflikte: {conflicts}.")
         if args.dry_run:
