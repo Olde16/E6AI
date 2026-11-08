@@ -45,7 +45,7 @@ python sort_old_files.py --dry-run
 python sort_old_files.py
 ```
 
-Dateien ohne passende Post-ID/Metadaten und Zielkonflikte bleiben in `old/`; vorhandene Zieldateien werden nicht überschrieben.
+Dateien mit numerischer Post-ID werden vor der Zuordnung gegen die MD5 in SQLite geprüft. Nur passende Dateien kommen in die Director/Character-Struktur. Fehlende Datenbankeinträge, fehlende MD5 oder MD5-Abweichungen landen in `not_verified/`. Dateien ohne numerische Post-ID und Zielkonflikte bleiben in `old/`; vorhandene Zieldateien werden nicht überschrieben.
 
 Optionen für abweichende Pfade:
 
