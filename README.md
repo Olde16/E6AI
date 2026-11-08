@@ -8,7 +8,7 @@ Standardziel:
 
 `/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB/`
 
-Die SQLite-Datenbank liegt unter `archive/e6ai_archive.sqlite3`. Der Ordner `old/` wird vom neuen Download nicht durchsucht oder verändert.
+Die SQLite-Datenbank bleibt unter `archive/e6ai_archive.sqlite3` neben den Skripten (wie bisher). Der Ordner `TWS_AI_DB/old/` wird vom neuen Download nicht durchsucht oder verändert.
 
 ```bash
 python -m pip install -r requirements.txt
