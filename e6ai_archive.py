@@ -168,7 +168,7 @@ def connect_db(path: Path) -> sqlite3.Connection:
         post_id         INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
         tag_name        TEXT NOT NULL REFERENCES tags(name),
         category        TEXT NOT NULL DEFAULT '',
-        PRIMARY KEY (post_id, tag_name)
+        PRIMARY KEY (post_id, tag_name, category)
     );
 
     CREATE TABLE IF NOT EXISTS scan_state (
