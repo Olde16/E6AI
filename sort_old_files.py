@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Sort the protected legacy files in TWS_AI_DB/old using archive metadata.
+"""Sort protected legacy files in TWS_AI_DB/old using SQLite metadata and MD5.
 
-Default mode is a preview. Pass --apply to perform moves; no interactive
-confirmation is requested because invoking --apply is the authorization.
-Files that cannot be matched to a post in SQLite remain in old/ untouched.
+Normal execution performs moves without an interactive confirmation.
+Use --dry-run for a preview. Files without a numeric post ID and destination
+conflicts remain in old/; files that cannot be verified go to not_verified/.
 """
 
 from __future__ import annotations
