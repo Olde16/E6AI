@@ -381,7 +381,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
     dst.commit()
     LOG.info(
         "Fertig: %s Posts synchronisiert; fehlende Dateien am festen Nextcloud-Pfad: %s. "
-        "Es wurden keine Dateien geöffnet oder gehasht; die API-MD5 bleibt Referenz für spätere Prüfungen.",
+        "Es wurden keine Dateien geöffnet oder gehasht; der bereits in SQLite gespeicherte MD5-Prüfstatus wurde übernommen.",
         total, missing,
     )
 
