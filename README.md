@@ -6,7 +6,7 @@ Werkzeuge zur Sicherung der e6AI-Post-Metadaten und Originaldateien.
 
 Standardziel:
 
-`/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB/`
+`/TWS_AI_DB/`
 
 Die SQLite-Datenbank liegt unter `archive/e6ai_archive.sqlite3`.
 
