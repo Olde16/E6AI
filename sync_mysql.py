@@ -20,11 +20,16 @@ from typing import Any
 import pymysql
 from pymysql.cursors import DictCursor
 
+from e6ai_archive import (
+    API_BASE, DEFAULT_USER_AGENT, AdaptiveRateLimiter, RateLimitedSession,
+)
+
 LOG = logging.getLogger("sync_mysql")
 DEFAULT_SQLITE = Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3"
 IMAGE_ROOT = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
 BATCH_SIZE = 500
 HASH_CHUNK_SIZE = 4 * 1024 * 1024
+API_REQUEST_INTERVAL = 1.0
 
 
 def utc_now() -> str:
@@ -64,6 +69,14 @@ def create_schema(conn) -> None:
             file_exists TINYINT NOT NULL DEFAULT 0, downloaded TINYINT NOT NULL DEFAULT 0,
             verification_status VARCHAR(32) NULL, download_error TEXT NULL,
             scanned_at VARCHAR(64) NULL, post_data JSON NOT NULL,
+            api_data JSON NULL, api_fetched_at VARCHAR(64) NULL,
+            api_fetch_status VARCHAR(32) NULL,
+            score_up INT NULL, score_down INT NULL, score_total INT NULL,
+            fav_count INT NULL, comment_count INT NULL,
+            uploader_id BIGINT NULL, approver_id BIGINT NULL,
+            is_favorited TINYINT NULL, locked_tags JSON NULL,
+            flags JSON NULL, preview JSON NULL, sample JSON NULL,
+            pools JSON NULL, relationships JSON NULL,
             synced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 ON UPDATE CURRENT_TIMESTAMP,
             KEY idx_posts_created (created_at), KEY idx_posts_rating (rating),
@@ -112,6 +125,16 @@ def create_schema(conn) -> None:
             ("file_md5", "CHAR(32) NULL"),
             ("md5_matches", "TINYINT NULL"),
             ("md5_checked_at", "VARCHAR(64) NULL"),
+            ("api_data", "JSON NULL"),
+            ("api_fetched_at", "VARCHAR(64) NULL"),
+            ("api_fetch_status", "VARCHAR(32) NULL"),
+            ("score_up", "INT NULL"), ("score_down", "INT NULL"),
+            ("score_total", "INT NULL"), ("fav_count", "INT NULL"),
+            ("comment_count", "INT NULL"), ("uploader_id", "BIGINT NULL"),
+            ("approver_id", "BIGINT NULL"), ("is_favorited", "TINYINT NULL"),
+            ("locked_tags", "JSON NULL"), ("flags", "JSON NULL"),
+            ("preview", "JSON NULL"), ("sample", "JSON NULL"),
+            ("pools", "JSON NULL"), ("relationships", "JSON NULL"),
         ):
             if name not in columns:
                 cur.execute(f"ALTER TABLE posts ADD COLUMN {name} {definition}")
@@ -282,7 +305,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
                     is_deleted=VALUES(is_deleted),width=VALUES(width),height=VALUES(height),
                     extension=VALUES(extension),file_size=VALUES(file_size),md5=VALUES(md5),
                     file_md5=CASE WHEN VALUES(md5_matches)=1 OR file_md5 IS NULL\n                        THEN VALUES(file_md5) ELSE file_md5 END,
-                    md5_matches=VALUES(md5_matches),
+                    md5_matches=COALESCE(VALUES(md5_matches),md5_matches),
                     md5_checked_at=COALESCE(VALUES(md5_checked_at),md5_checked_at),
                     file_url=VALUES(file_url),
                     absolute_path=VALUES(absolute_path),file_exists=VALUES(file_exists),
@@ -345,11 +368,183 @@ def sync(src: sqlite3.Connection, dst) -> None:
     )
 
 
+
+def build_file_index(root: Path) -> dict[int, list[Path]]:
+    """Index archive filenames once; never open or hash image contents."""
+    index: dict[int, list[Path]] = {}
+    if not root.is_dir():
+        LOG.warning("Bildarchiv nicht erreichbar; Dateisuche übersprungen: %s", root)
+        return index
+    for directory, _subdirs, filenames in os.walk(root):
+        for filename in filenames:
+            if filename.endswith(".part"):
+                continue
+            stem = Path(filename).stem
+            # Normal archive names are <post_id>.<extension>. Also accept
+            # numbered collision names such as <post_id>.1.<extension>.
+            first = stem.split(".", 1)[0]
+            if first.isdigit():
+                index.setdefault(int(first), []).append(Path(directory) / filename)
+    for paths in index.values():
+        paths.sort(key=lambda p: (len(p.name.split(".")) != 2, len(str(p)), str(p)))
+    LOG.info("Dateiindex aufgebaut: %s Post-IDs gefunden.", len(index))
+    return index
+
+
+def resolve_post_file(sqlite_path: Any, post_id: int, file_index: dict[int, list[Path]]) -> tuple[str | None, bool]:
+    # An explicit SQLite path always wins, even if the file is currently absent.
+    if sqlite_path:
+        absolute, exists = resolve_file(sqlite_path)
+        return absolute, exists
+    candidates = file_index.get(post_id, [])
+    if not candidates:
+        return None, False
+    # Prefer the conventional <id>.<ext> name, then the shortest stable path.
+    chosen = candidates[0].resolve()
+    return str(chosen), chosen.is_file()
+
+
+def json_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def fetch_post_detail(client: RateLimitedSession, post_id: int) -> dict[str, Any] | None:
+    """Fetch one complete post record using the same HTTP/retry/rate-limit logic as the archive."""
+    response = client.get(f"{API_BASE}/posts/{post_id}.json")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Post {post_id}: API lieferte ungültiges JSON") from exc
+    if isinstance(payload, dict) and isinstance(payload.get("post"), dict):
+        payload = payload["post"]
+    if not isinstance(payload, dict) or int(payload.get("id", -1)) != post_id:
+        raise RuntimeError(f"Post {post_id}: unerwartete API-Antwort")
+    return payload
+
+
+def enrich_mysql_from_api(dst, refresh: bool = False, limit: int | None = None) -> None:
+    """Fetch every SQLite-seeded MySQL post missing its API snapshot."""
+    query = "SELECT id FROM posts"
+    if not refresh:
+        query += " WHERE api_fetched_at IS NULL"
+    query += " ORDER BY id"
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+
+    with dst.cursor() as cur:
+        cur.execute(query)
+        post_ids = [int(row["id"]) for row in cur.fetchall()]
+    if not post_ids:
+        LOG.info("Keine Posts benötigen einen API-Abruf.")
+        return
+
+    LOG.info(
+        "Starte API-Anreicherung für %s Posts (Request-Abstand %.1f Sekunden).",
+        len(post_ids), API_REQUEST_INTERVAL,
+    )
+    client = RateLimitedSession(
+        DEFAULT_USER_AGENT,
+        limiter=AdaptiveRateLimiter(
+            min_interval=API_REQUEST_INTERVAL,
+            initial_interval=API_REQUEST_INTERVAL,
+        ),
+    )
+    completed = found = not_found = failed = 0
+    try:
+        for post_id in post_ids:
+            fetched_at = utc_now()
+            try:
+                data = fetch_post_detail(client, post_id)
+                score = data.get("score") or {}
+                relationships = data.get("relationships")
+                with dst.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE posts SET
+                            api_data=%s, api_fetched_at=%s, api_fetch_status='ok',
+                            score_up=%s, score_down=%s, score_total=%s,
+                            fav_count=%s, comment_count=%s,
+                            uploader_id=%s, approver_id=%s, is_favorited=%s,
+                            locked_tags=%s, flags=%s, preview=%s, sample=%s,
+                            pools=%s, relationships=%s,
+                            -- Fill core columns only when the SQLite snapshot lacked a value.
+                            created_at=COALESCE(created_at,%s),
+                            updated_at=COALESCE(updated_at,%s),
+                            change_seq=COALESCE(change_seq,%s),
+                            rating=COALESCE(rating,%s),
+                            description=COALESCE(description,%s),
+                            source=COALESCE(source,%s),
+                            parent_id=COALESCE(parent_id,%s),
+                            has_children=COALESCE(has_children,%s),
+                            is_deleted=GREATEST(is_deleted,COALESCE(%s,0)),
+                            width=COALESCE(width,%s), height=COALESCE(height,%s),
+                            extension=COALESCE(extension,%s), file_size=COALESCE(file_size,%s),
+                            md5=COALESCE(md5,%s), file_url=COALESCE(file_url,%s)
+                        WHERE id=%s
+                        """,
+                        (
+                            json_value(data), fetched_at,
+                            score.get("up"), score.get("down"), score.get("total"),
+                            data.get("fav_count"), data.get("comment_count"),
+                            data.get("uploader_id"), data.get("approver_id"),
+                            None if "is_favorited" not in data else int(bool(data.get("is_favorited"))),
+                            json_value(data.get("locked_tags")), json_value(data.get("flags")),
+                            json_value(data.get("preview")), json_value(data.get("sample")),
+                            json_value(data.get("pools")), json_value(relationships),
+                            data.get("created_at"), data.get("updated_at"), data.get("change_seq"),
+                            data.get("rating"), data.get("description"),
+                            json_value(data.get("sources")) if isinstance(data.get("sources"), (list, dict)) else data.get("sources"),
+                            (relationships or {}).get("parent_id"),
+                            None if "has_children" not in (relationships or {}) else int(bool(relationships.get("has_children"))),
+                            int(bool((data.get("flags") or {}).get("deleted"))),
+                            (data.get("file") or {}).get("width"), (data.get("file") or {}).get("height"),
+                            (data.get("file") or {}).get("ext"), (data.get("file") or {}).get("size"),
+                            (data.get("file") or {}).get("md5"), (data.get("file") or {}).get("url"),
+                            post_id,
+                        ),
+                    )
+                dst.commit()
+                found += 1
+            except Exception as exc:
+                # Record a failed attempt so one unavailable post does not block
+                # the rest; allow retry on the next run by leaving fetched_at NULL.
+                status = "not_found" if "HTTP 404" in str(exc) else "error"
+                with dst.cursor() as cur:
+                    cur.execute(
+                        "UPDATE posts SET api_fetch_status=%s WHERE id=%s",
+                        (status, post_id),
+                    )
+                dst.commit()
+                if status == "not_found":
+                    not_found += 1
+                    LOG.warning("Post %s ist über die API nicht mehr abrufbar: %s", post_id, exc)
+                else:
+                    failed += 1
+                    LOG.error("API-Abruf für Post %s fehlgeschlagen: %s", post_id, exc)
+            completed += 1
+            if completed % 100 == 0 or completed == len(post_ids):
+                LOG.info(
+                    "API-Fortschritt: %s/%s; erhalten: %s; nicht gefunden: %s; Fehler: %s",
+                    completed, len(post_ids), found, not_found, failed,
+                )
+    finally:
+        client.close()
+    LOG.info(
+        "API-Anreicherung beendet: %s erfolgreich, %s nicht gefunden, %s Fehler.",
+        found, not_found, failed,
+    )
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Überträgt das e6AI-SQLite-Archiv nach MySQL und prüft Datei-MD5."
+        description="Überträgt SQLite-Metadaten und reichert alle Posts über die e6AI-API an."
     )
     parser.add_argument("--sqlite", type=Path, default=DEFAULT_SQLITE)
+    parser.add_argument("--refresh-api", action="store_true",
+                        help="Alle Posts erneut von der e6AI-API abrufen, auch bereits angereicherte.")
+    parser.add_argument("--api-limit", type=int, default=None,
+                        help="API-Abrufe auf diese Anzahl Posts begrenzen (für Testläufe).")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     if not args.sqlite.is_file():
@@ -360,6 +555,7 @@ def main() -> int:
     try:
         dst = mysql_connection()
         sync(src, dst)
+        enrich_mysql_from_api(dst, refresh=args.refresh_api, limit=args.api_limit)
         return 0
     except Exception:
         LOG.exception("MySQL-Synchronisierung fehlgeschlagen; SQLite-Quelle blieb unverändert.")
