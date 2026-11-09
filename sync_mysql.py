@@ -288,7 +288,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
                     parent_id=VALUES(parent_id),has_children=VALUES(has_children),
                     is_deleted=VALUES(is_deleted),width=VALUES(width),height=VALUES(height),
                     extension=VALUES(extension),file_size=VALUES(file_size),md5=VALUES(md5),
-                    file_md5=COALESCE(VALUES(file_md5),file_md5),
+                    file_md5=CASE WHEN VALUES(md5_matches)=1 OR file_md5 IS NULL\n                        THEN VALUES(file_md5) ELSE file_md5 END,
                     md5_matches=VALUES(md5_matches),
                     md5_checked_at=COALESCE(VALUES(md5_checked_at),md5_checked_at),
                     file_url=VALUES(file_url),
