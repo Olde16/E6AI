@@ -201,9 +201,11 @@ def normalized_md5(value: Any) -> str | None:
     return value if len(value) == 32 and all(c in "0123456789abcdef" for c in value) else None
 
 
-def sync(src: sqlite3.Connection, dst) -> None:
+def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
     src.row_factory = sqlite3.Row
+    LOG.info("MySQL-Schema prüfen und ggf. ergänzen ...")
     create_schema(dst)
+    LOG.info("Lese Tags und Favoriten aus SQLite ...")
 
     tags_by_post: dict[int, list[dict[str, str]]] = {}
     for row in src.execute(
@@ -212,6 +214,8 @@ def sync(src: sqlite3.Connection, dst) -> None:
         tags_by_post.setdefault(int(row["post_id"]), []).append({
             "name": row["tag_name"], "category": row["category"] or ""
         })
+
+    LOG.info("Tags geladen: %s Post-Zuordnungen.", sum(map(len, tags_by_post.values())))
 
     favorites_by_post: dict[int, list[dict[str, Any]]] = {}
     if table_exists(src, "favorites"):
@@ -223,6 +227,9 @@ def sync(src: sqlite3.Connection, dst) -> None:
                 "username": row["username"], "first_seen_at": row["first_seen_at"],
                 "last_seen_at": row["last_seen_at"], "is_favorite": int(row["is_favorite"]),
             })
+
+    LOG.info("Favoriten geladen: %s Post-Zuordnungen.", sum(map(len, favorites_by_post.values())))
+    LOG.info("Erstelle Dateinamen-Index unter %s ...", IMAGE_ROOT)
 
     # Rebuild relation tables from the authoritative SQLite snapshot. Posts are
     # upserted first so all foreign-key targets exist before relation inserts.
@@ -379,6 +386,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
                         (api_row["id"], name, category),
                     )
     dst.commit()
+    LOG.info("Baue Tag- und Favoriten-Verknüpfungen in MySQL neu auf ...")
     LOG.info(
         "Fertig: %s Posts synchronisiert; fehlende Dateien am festen Nextcloud-Pfad: %s. "
         "Es wurden keine Dateien geöffnet oder gehasht; der bereits in SQLite gespeicherte MD5-Prüfstatus wurde übernommen.",
@@ -480,6 +488,7 @@ def enrich_mysql_from_api(dst, refresh: bool = False, limit: int | None = None) 
         "Starte API-Anreicherung für %s Posts (Request-Abstand %.1f Sekunden).",
         len(post_ids), API_REQUEST_INTERVAL,
     )
+    progress_interval = max(1, min(100, len(post_ids) // 20 or 1))
     client = RateLimitedSession(
         DEFAULT_USER_AGENT,
         limiter=AdaptiveRateLimiter(
@@ -491,6 +500,7 @@ def enrich_mysql_from_api(dst, refresh: bool = False, limit: int | None = None) 
     try:
         for post_id in post_ids:
             fetched_at = utc_now()
+            LOG.debug("API-Abruf für Post %s gestartet (%s/%s).", post_id, completed + 1, len(post_ids))
             try:
                 data = fetch_post_detail(client, post_id)
                 score = data.get("score") or {}
@@ -578,7 +588,7 @@ def enrich_mysql_from_api(dst, refresh: bool = False, limit: int | None = None) 
                     failed += 1
                     LOG.error("API-Abruf für Post %s fehlgeschlagen: %s", post_id, exc)
             completed += 1
-            if completed % 100 == 0 or completed == len(post_ids):
+            if completed % progress_interval == 0 or completed == len(post_ids):
                 LOG.info(
                     "API-Fortschritt: %s/%s; erhalten: %s; nicht gefunden: %s; Fehler: %s",
                     completed, len(post_ids), found, not_found, failed,
@@ -599,19 +609,29 @@ def main() -> int:
                         help="Alle Posts erneut von der e6AI-API abrufen, auch bereits angereicherte.")
     parser.add_argument("--api-limit", type=int, default=None,
                         help="API-Abrufe auf diese Anzahl Posts begrenzen (für Testläufe).")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Zusätzliche Details ausgeben (inkl. einzelner API-Abrufe).")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        force=True,
+    )
     if args.api_limit is not None and args.api_limit < 1:
         LOG.error("--api-limit muss mindestens 1 sein.")
         return 2
     if not args.sqlite.is_file():
         LOG.error("SQLite-Archiv nicht gefunden: %s", args.sqlite)
         return 2
+    LOG.info("SQLite-Archiv: %s", args.sqlite)
+    LOG.info("Verbinde mit MySQL ...")
     src = sqlite3.connect(f"file:{args.sqlite.resolve()}?mode=ro", uri=True)
     dst = None
     try:
         dst = mysql_connection()
-        sync(src, dst)
+        LOG.info("MySQL-Verbindung hergestellt.")
+        sync(src, dst, verbose=args.verbose)
+        LOG.info("Starte API-Phase ...")
         enrich_mysql_from_api(dst, refresh=args.refresh_api, limit=args.api_limit)
         return 0
     except Exception:
