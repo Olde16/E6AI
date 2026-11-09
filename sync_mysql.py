@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Synchronize the e6AI SQLite archive into MySQL/MariaDB.
+"""Synchronize SQLite archive metadata and enrich every post from the e6AI API.
 
 SQLite remains read-only. Original files stay at the fixed Nextcloud archive
-location; MySQL stores their absolute paths and independently calculated MD5s.
+location; MySQL stores their absolute paths and complete API JSON snapshots.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -28,7 +27,6 @@ LOG = logging.getLogger("sync_mysql")
 DEFAULT_SQLITE = Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3"
 IMAGE_ROOT = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
 BATCH_SIZE = 500
-HASH_CHUNK_SIZE = 4 * 1024 * 1024
 API_REQUEST_INTERVAL = 1.0
 
 
@@ -194,14 +192,6 @@ def resolve_file(value: Any) -> tuple[str | None, bool]:
         path = IMAGE_ROOT / path
     path = path.resolve()
     return str(path), path.is_file()
-
-
-def calculate_md5(path: str) -> str:
-    digest = hashlib.md5()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def normalized_md5(value: Any) -> str | None:
