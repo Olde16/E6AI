@@ -460,7 +460,25 @@ def enrich_mysql_from_api(dst, refresh: bool = False, limit: int | None = None) 
                 data = fetch_post_detail(client, post_id)
                 score = data.get("score") or {}
                 relationships = data.get("relationships")
+                api_tags = data.get("tags") or {}
+                api_tag_rows = []
+                if isinstance(api_tags, dict):
+                    for category, names in api_tags.items():
+                        if isinstance(category, str) and isinstance(names, list):
+                            api_tag_rows.extend(
+                                (post_id, name, category)
+                                for name in names if isinstance(name, str) and name
+                            )
                 with dst.cursor() as cur:
+                    if api_tag_rows:
+                        cur.executemany(
+                            "INSERT IGNORE INTO tags(name,category) VALUES (%s,%s)",
+                            [(name, category) for _, name, category in api_tag_rows],
+                        )
+                        cur.executemany(
+                            "INSERT IGNORE INTO post_tags(post_id,tag_name,category) VALUES (%s,%s,%s)",
+                            api_tag_rows,
+                        )
                     cur.execute(
                         """
                         UPDATE posts SET
