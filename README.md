@@ -88,6 +88,17 @@ export DB_PASSWORD='DEIN_DB_PASSWORT'
 
 python -m pip install -r requirements.txt
 python sync_mysql.py
+
+
+Der MySQL-Import ist bewusst **metadaten-only**: Er öffnet keine Bilddateien und berechnet keine Prüfsummen. Die von e6AI gelieferte MD5 wird unverändert in `posts.md5` als Referenz gespeichert.
+
+Eine Dateiprüfung erfolgt ausschließlich bei einem späteren, ausdrücklich gestarteten Lauf:
+
+```bash
+python verify_mysql_files.py
+```
+
+Das Prüfskript liest die Dateien am fest hinterlegten Nextcloud-Pfad, berechnet deren MD5 und speichert das Ergebnis getrennt in `file_md5`, `md5_matches` und `md5_checked_at`. Die Referenz in `md5` wird niemals verändert. Standardmäßig werden nur noch nicht geprüfte Dateien geprüft; mit `--all` wird der gesamte Bestand erneut geprüft, mit `--limit 1000` nur eine begrenzte Anzahl.
 ```
 
 Optional:
