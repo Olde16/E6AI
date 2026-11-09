@@ -73,7 +73,9 @@ Für den API-Abruf wird ein Request-Abstand von mindestens einer Sekunde verwend
 
 ## MySQL-Kopie auf dem Server
 
-`sync_mysql.py` überträgt die vorhandenen SQLite-Postdaten, Tags, Post-Tag-Zuordnungen und Favoriten nach MySQL. Die SQLite-Datei wird ausschließlich lesend geöffnet und bleibt unverändert. Die Nextcloud-Dateien werden nicht zum SQL-Server kopiert; in MySQL wird nur ihr absoluter Dateipfad gespeichert. Das Feld `post_data` enthält einen JSON-Snapshot aus allen Feldern, Tags und Favoriten, die aktuell in SQLite vorhanden sind.
+`sync_mysql.py` überträgt die vorhandenen SQLite-Postdaten, Tags, Post-Tag-Zuordnungen und Favoriten nach MySQL. Die SQLite-Datei wird ausschließlich lesend geöffnet und bleibt unverändert. Die Nextcloud-Dateien werden nicht zum SQL-Server kopiert; in MySQL wird ausschließlich ihr absoluter Dateipfad unter dem fest im Skript hinterlegten Nextcloud-Stammpfad gespeichert. Dieser Pfad ist absichtlich nicht als Option konfigurierbar.
+
+Beim Synchronisieren wird jede vorhandene Datei vollständig gelesen und ihre MD5-Prüfsumme neu berechnet. `md5` enthält die von e6AI gelieferte Soll-Prüfsumme, `file_md5` die unabhängig berechnete Prüfsumme. `md5_matches` ist `1`, wenn beide übereinstimmen, `0` bei einer Abweichung und `NULL`, wenn keine Datei vorhanden ist. `md5_checked_at` speichert den Prüfzeitpunkt. So lassen sich spätere Integritätsläufe durchführen, indem die Datei erneut gehasht und `file_md5` mit dem gespeicherten Wert verglichen wird. Das Feld `post_data` enthält einen JSON-Snapshot der in SQLite vorhandenen Post-Felder, Tags, Favoriten und Prüfergebnisse.
 
 Zugangsdaten über Umgebungsvariablen setzen:
 
@@ -91,7 +93,7 @@ python sync_mysql.py
 Optional:
 
 ```bash
-python sync_mysql.py --sqlite /pfad/e6ai_archive.sqlite3 --image-root /absoluter/pfad/zum/Nextcloud-Archiv
+python sync_mysql.py --sqlite /pfad/e6ai_archive.sqlite3
 ```
 
-Der Lauf ist wiederholbar: bestehende Posts werden anhand ihrer e6AI-ID aktualisiert. `absolute_path` verweist auf den Nextcloud-Dateipfad; `file_exists` hält fest, ob die Datei beim Synchronisieren dort vorhanden war.
+Der Lauf ist wiederholbar: bestehende Posts werden anhand ihrer e6AI-ID aktualisiert. `absolute_path` verweist auf den Nextcloud-Dateipfad; `file_exists` hält fest, ob die Datei beim Synchronisieren dort vorhanden war. Tag-Namen werden zusammen mit ihrer Kategorie als Schlüssel behandelt. Tag-Verknüpfungen und Favoriten werden beim Sync exakt an den SQLite-Stand angeglichen.
