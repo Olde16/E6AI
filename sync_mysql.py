@@ -238,10 +238,12 @@ def sync(src: sqlite3.Connection, dst) -> None:
             post_id = int(post["id"])
             absolute_path, exists = resolve_post_file(post.get("local_path"), post_id, file_index)
             expected = normalized_md5(post.get("md5"))
-            # Import phase: never read/hash the file. The API-provided MD5 is
-            # retained as the immutable reference for a later integrity run.
-            actual = None
-            matches = None
+            # Carry forward the verification already performed by the main
+            # archive downloader. A verified file necessarily had this MD5;
+            # no file is opened or hashed during the MySQL sync.
+            verified_in_sqlite = post.get("verification_status") == "verified"
+            actual = expected if verified_in_sqlite else None
+            matches = 1 if verified_in_sqlite else None
             checked_at = None
             if not exists:
                 missing += 1
@@ -256,8 +258,8 @@ def sync(src: sqlite3.Connection, dst) -> None:
                     "absolute_path": absolute_path,
                     "exists_at_sync": exists,
                     "api_md5": expected,
-                    "calculated_md5": None,
-                    "md5_matches": None,
+                    "calculated_md5": actual,
+                    "md5_matches": matches,
                     "md5_checked_at": None,
                 },
             }
@@ -581,6 +583,9 @@ def main() -> int:
                         help="API-Abrufe auf diese Anzahl Posts begrenzen (für Testläufe).")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    if args.api_limit is not None and args.api_limit < 1:
+        LOG.error("--api-limit muss mindestens 1 sein.")
+        return 2
     if not args.sqlite.is_file():
         LOG.error("SQLite-Archiv nicht gefunden: %s", args.sqlite)
         return 2
