@@ -20,7 +20,7 @@ import pymysql
 from pymysql.cursors import DictCursor
 
 from e6ai_archive import (
-    API_BASE, DEFAULT_USER_AGENT, AdaptiveRateLimiter, RateLimitedSession,
+    API_BASE, POSTS_ENDPOINT, DEFAULT_USER_AGENT, AdaptiveRateLimiter, RateLimitedSession,
 )
 
 LOG = logging.getLogger("sync_mysql")
@@ -432,15 +432,31 @@ def json_value(value: Any) -> str | None:
 
 def fetch_post_detail(client: RateLimitedSession, post_id: int) -> dict[str, Any] | None:
     """Fetch one complete post record using the same HTTP/retry/rate-limit logic as the archive."""
-    response = client.get(f"{API_BASE}/posts/{post_id}.json")
     try:
+        response = client.get(f"{API_BASE}/posts/{post_id}.json")
         payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Post {post_id}: API lieferte ungültiges JSON") from exc
+    except Exception as direct_error:
+        # Fallback to the documented paginated post search. status:any also
+        # includes deleted posts, matching the original archive scan.
+        if "HTTP 404" not in str(direct_error):
+            raise
+        response = client.get(
+            POSTS_ENDPOINT,
+            params={"tags": f"id:{post_id} status:any", "limit": 1},
+        )
+        payload = response.json()
+
     if isinstance(payload, dict) and isinstance(payload.get("post"), dict):
         payload = payload["post"]
+    if isinstance(payload, dict) and isinstance(payload.get("posts"), list):
+        payload = payload["posts"]
+    if isinstance(payload, list):
+        payload = next(
+            (item for item in payload if isinstance(item, dict) and int(item.get("id", -1)) == post_id),
+            None,
+        )
     if not isinstance(payload, dict) or int(payload.get("id", -1)) != post_id:
-        raise RuntimeError(f"Post {post_id}: unerwartete API-Antwort")
+        raise RuntimeError(f"Post {post_id}: unerwartete oder leere API-Antwort")
     return payload
 
 
