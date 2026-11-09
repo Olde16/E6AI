@@ -36,7 +36,7 @@ Gespeichert werden:
 - Flags, gesperrte Tags, Preview-/Sample-Metadaten, Pool-IDs und Post-Beziehungen als JSON
 - zusätzliche aktuelle Tag-Zuordnungen samt Kategorie in `tags` und `post_tags`
 
-Die vorhandenen SQLite-Werte bleiben erhalten. API-Daten ergänzen fehlende Kernwerte; die vollständige API-Antwort bleibt zusätzlich separat erhalten.
+Die vorhandenen SQLite-Werte bleiben erhalten. API-Daten ergänzen fehlende Kernwerte; die vollständige API-Antwort bleibt zusätzlich separat erhalten. Der bereits beim Archiv-Download durchgeführte MD5-Abgleich wird aus SQLite übernommen: bei `verification_status='verified'` wird `md5_matches=1` und die bestätigte Prüfsumme in `file_md5` gespeichert. Es findet beim MySQL-Sync keine erneute Dateiprüfung statt.
 
 ### Dateipfade
 
