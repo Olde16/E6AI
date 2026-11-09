@@ -237,6 +237,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
     # Rebuild relation tables from the authoritative SQLite snapshot. Posts are
     # upserted first so all foreign-key targets exist before relation inserts.
     total = missing = 0
+    file_index = build_file_index(IMAGE_ROOT)
     post_cursor = src.execute("SELECT * FROM posts ORDER BY id")
     for chunk in batches(post_cursor):
         values = []
@@ -245,7 +246,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
         for row in chunk:
             post = dict(row)
             post_id = int(post["id"])
-            absolute_path, exists = resolve_file(post.get("local_path"))
+            absolute_path, exists = resolve_post_file(post.get("local_path"), post_id, file_index)
             expected = normalized_md5(post.get("md5"))
             # Import phase: never read/hash the file. The API-provided MD5 is
             # retained as the immutable reference for a later integrity run.
@@ -513,8 +514,8 @@ def enrich_mysql_from_api(dst, refresh: bool = False, limit: int | None = None) 
                 status = "not_found" if "HTTP 404" in str(exc) else "error"
                 with dst.cursor() as cur:
                     cur.execute(
-                        "UPDATE posts SET api_fetch_status=%s WHERE id=%s",
-                        (status, post_id),
+                        "UPDATE posts SET api_fetch_status=%s, api_fetched_at=%s WHERE id=%s",
+                        (status, fetched_at if status == "not_found" else None, post_id),
                     )
                 dst.commit()
                 if status == "not_found":
