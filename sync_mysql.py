@@ -361,6 +361,31 @@ def sync(src: sqlite3.Connection, dst) -> None:
                     (row["username"], row["post_id"], row["first_seen_at"],
                      row["last_seen_at"], row["is_favorite"]),
                 )
+        # Re-apply API-only tag categories from the stored raw API snapshots.
+        # This keeps the normalized tag index intact on later SQLite syncs.
+        cur.execute("SELECT id, api_data FROM posts WHERE api_data IS NOT NULL")
+        for api_row in cur.fetchall():
+            try:
+                api_post = json.loads(api_row["api_data"])
+            except (TypeError, ValueError):
+                continue
+            api_tags = api_post.get("tags") or {}
+            if not isinstance(api_tags, dict):
+                continue
+            for category, names in api_tags.items():
+                if not isinstance(category, str) or not isinstance(names, list):
+                    continue
+                for name in names:
+                    if not isinstance(name, str) or not name:
+                        continue
+                    cur.execute(
+                        "INSERT IGNORE INTO tags(name,category) VALUES (%s,%s)",
+                        (name, category),
+                    )
+                    cur.execute(
+                        "INSERT IGNORE INTO post_tags(post_id,tag_name,category) VALUES (%s,%s,%s)",
+                        (api_row["id"], name, category),
+                    )
     dst.commit()
     LOG.info(
         "Fertig: %s Posts synchronisiert; fehlende Dateien am festen Nextcloud-Pfad: %s. "
