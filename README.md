@@ -8,74 +8,41 @@ Standardziel:
 
 `/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB/`
 
-Die SQLite-Datenbank bleibt unter `archive/e6ai_archive.sqlite3` neben den Skripten (wie bisher). Der Ordner `TWS_AI_DB/old/` wird vom neuen Download nicht durchsucht oder verändert.
+Die SQLite-Datenbank liegt unter `archive/e6ai_archive.sqlite3`.
 
 ```bash
 python -m pip install -r requirements.txt
 
-# Metadaten vollständig erfassen und anschließend fehlende Originaldateien laden
+# Metadaten vollständig erfassen und fehlende Originaldateien laden
 python e6ai_archive.py --download
 
-# Nach Abbruch nur die noch offenen Downloads fortsetzen
-python e6ai_archive.py --download-only
-
-# Parallele Downloads (Standard: 3 Worker; global adaptives Request-Limit)
+# Nach Abbruch nur noch offene Downloads fortsetzen
 python e6ai_archive.py --download-only --workers 3
 ```
 
-Jeder Post wird genau einem Ordner zugeordnet:
+Jeder Post wird anhand seiner Tags einem Archivordner zugeordnet. Eine Datei wird beim ursprünglichen Download anhand der von e6AI gelieferten MD5 geprüft. Der Prüfstatus wird in SQLite gespeichert. Die Bilddateien bleiben auf Nextcloud.
 
-- ein Director/Artist-Tag + ein Character-Tag: `<Director>/<Character>/<postID>.<ext>`
-- mehrere Director/Artist-Tags: `collabs/`
-- kein Director/Artist-Tag: `unknown/`
-- mehrere Character-Tags: `multiple/`
-- kein Character-Tag: `unknown/`
-- fehlende oder nicht passende MD5-Prüfung: `not_verified/<postID>.<ext>`
+## MySQL-Archiv und API-Anreicherung
 
-Die API-Kategorie `artist` wird als Director-Zuordnung behandelt; `director` wird ebenfalls akzeptiert. Eine Datei wird nur dann als verifiziert markiert, wenn eine API-MD5 vorhanden ist und exakt übereinstimmt. Nicht verifizierbare, aber abrufbare Dateien bleiben unter `not_verified/` erhalten. Ohne abrufbare Datei-URL bleiben die Metadaten in SQLite und der Fehler wird protokolliert. Bestehende Zieldateien werden niemals überschrieben.
+`sync_mysql.py` überträgt zunächst alle Posts, Tags, Tag-Zuordnungen und Favoriten aus SQLite nach MySQL. SQLite wird ausschließlich lesend geöffnet.
 
-Vor Downloads prüft das Skript den verfügbaren Speicherplatz und vergleicht ihn mit der aus den API-Dateigrößen geschätzten offenen Datenmenge. Die Zusammenfassung zeigt Gesamtgröße, gesicherte Größe und offene Größe.
+Danach wird für jede Post-ID in MySQL, für die noch kein erfolgreicher API-Abruf gespeichert ist, der vollständige Post-Datensatz über die e6AI-API abgerufen. Die HTTP- und Retry-Logik sowie der benutzerdefinierte User-Agent werden aus dem Hauptprogramm `e6ai_archive.py` wiederverwendet. Der Request-Abstand beträgt eine Sekunde, entsprechend der API-Empfehlung.
 
-## Altbestand vorsortieren
+Gespeichert werden:
+- der vollständige API-Response unverändert als JSON in `posts.api_data`
+- API-Abrufzeitpunkt und Abrufstatus
+- Score (Up-/Downvotes und Gesamtwert), Favoritenanzahl und Kommentaranzahl
+- Uploader- und Approver-ID sowie – falls von der API geliefert – der Favoritenstatus des authentifizierten Benutzers
+- Flags, gesperrte Tags, Preview-/Sample-Metadaten, Pool-IDs und Post-Beziehungen als JSON
+- zusätzliche aktuelle Tag-Zuordnungen samt Kategorie in `tags` und `post_tags`
 
-Den bisherigen Bestand vorher nach `TWS_AI_DB/old/` legen. Erst den Metadaten-Scan vollständig abschließen; das Sortierskript verweigert die Arbeit bei unvollständigem Scan. Danach verschiebt es die Dateien bei normaler Ausführung. Es fragt nicht interaktiv nach einer weiteren Bestätigung: Das Ausführen ist die Freigabe.
+Die vorhandenen SQLite-Werte bleiben erhalten. API-Daten ergänzen fehlende Kernwerte; die vollständige API-Antwort bleibt zusätzlich separat erhalten.
 
-```bash
-# Vorschau, ohne Änderungen
-python sort_old_files.py --dry-run
+### Dateipfade
 
-# Dateien tatsächlich einsortieren
-python sort_old_files.py
-```
+Wenn SQLite für einen Post bereits einen `local_path` enthält, wird genau dieser Pfad übernommen. Nur wenn SQLite keinen Pfad enthält, durchsucht das Skript den fest hinterlegten Nextcloud-Archivordner einmalig und erstellt daraus einen Dateiindex anhand der Post-IDs. Die Bilddateien werden dabei weder geöffnet noch kopiert oder gehasht. MySQL speichert den absoluten Pfad und den Status, ob die Datei zum Sync-Zeitpunkt existiert.
 
-Dateien mit numerischer Post-ID werden vor der Zuordnung gegen die MD5 in SQLite geprüft. Nur passende Dateien kommen in die Director/Character-Struktur. Fehlende Datenbankeinträge, fehlende MD5 oder MD5-Abweichungen landen in `not_verified/`. Dateien ohne numerische Post-ID und Zielkonflikte bleiben in `old/`; vorhandene Zieldateien werden nicht überschrieben.
-
-Optionen für abweichende Pfade:
-
-```bash
-python e6ai_archive.py --db /pfad/archive.sqlite3 --image-dir /pfad/TWS_AI_DB --download
-python sort_old_files.py --root /pfad/TWS_AI_DB --db /pfad/archive.sqlite3
-```
-
-## Favoriten importieren
-
-Das separate Script `import_favorites.py` liest die Favoriten des angegebenen e6AI-Kontos über die paginierbare Post-Suche `/posts.json?tags=fav:<username>` ein. `/favorites.json` besitzt laut API-Dokumentation keinen dokumentierten Cursor-Parameter und ist deshalb für große Favoritenlisten ungeeignet. Benutzername und API-Schlüssel werden beim Start abgefragt; die API-Schlüsseleingabe bleibt verdeckt. Der Schlüssel wird nicht gespeichert.
-
-Die Favoriten-Postdaten und Tags werden in dieselbe SQLite-Datenbank übernommen. Zusätzlich gibt es die Tabelle `favorites` mit Benutzername, Post-ID und aktuellem Favoritenstatus. Der Import läuft mit dem dokumentierten `page=b<ID>`-Cursor bis zu einer leeren Ergebnisseite. Nur ein vollständig erfolgreicher Durchlauf markiert inzwischen entfernte Favoriten als nicht mehr favorisiert. Bei API-Fehlern oder fehlendem Pagination-Fortschritt wird dieser Abgleich nicht durchgeführt.
-
-Das Script lädt keine Originaldateien herunter und verändert keine Archivdateien. Es verwendet standardmäßig dieselbe Datenbank unter `archive/e6ai_archive.sqlite3`.
-
-```bash
-python import_favorites.py
-```
-
-Für den API-Abruf wird ein Request-Abstand von mindestens einer Sekunde verwendet.
-
-## MySQL-Kopie auf dem Server
-
-`sync_mysql.py` überträgt die vorhandenen SQLite-Postdaten, Tags, Post-Tag-Zuordnungen und Favoriten nach MySQL. Die SQLite-Datei wird ausschließlich lesend geöffnet und bleibt unverändert. Die Nextcloud-Dateien werden nicht zum SQL-Server kopiert; in MySQL wird ausschließlich ihr absoluter Dateipfad unter dem fest im Skript hinterlegten Nextcloud-Stammpfad gespeichert. Dieser Pfad ist absichtlich nicht als Option konfigurierbar.
-
-Beim Synchronisieren wird jede vorhandene Datei vollständig gelesen und ihre MD5-Prüfsumme neu berechnet. `md5` enthält die von e6AI gelieferte Soll-Prüfsumme, `file_md5` die unabhängig berechnete Prüfsumme. `md5_matches` ist `1`, wenn beide übereinstimmen, `0` bei einer Abweichung und `NULL`, wenn keine Datei vorhanden ist. `md5_checked_at` speichert den Prüfzeitpunkt. So lassen sich spätere Integritätsläufe durchführen, indem die Datei erneut gehasht und `file_md5` mit dem gespeicherten Wert verglichen wird. Das Feld `post_data` enthält einen JSON-Snapshot der in SQLite vorhandenen Post-Felder, Tags, Favoriten und Prüfergebnisse.
+### Start und Fortsetzung
 
 Zugangsdaten über Umgebungsvariablen setzen:
 
@@ -88,23 +55,26 @@ export DB_PASSWORD='DEIN_DB_PASSWORT'
 
 python -m pip install -r requirements.txt
 python sync_mysql.py
+```
 
+Der Lauf ist fortsetzbar: Bereits erfolgreich abgerufene Posts werden bei späteren normalen Läufen nicht erneut angefragt. Fehlgeschlagene API-Abrufe bleiben für einen späteren Versuch offen. Nicht mehr abrufbare Posts (HTTP 404) werden als `not_found` markiert.
 
-Der MySQL-Import ist bewusst **metadaten-only**: Er öffnet keine Bilddateien und berechnet keine Prüfsummen. Die von e6AI gelieferte MD5 wird unverändert in `posts.md5` als Referenz gespeichert.
-
-Eine Dateiprüfung erfolgt ausschließlich bei einem späteren, ausdrücklich gestarteten Lauf:
+Für einen begrenzten Testlauf:
 
 ```bash
-python verify_mysql_files.py
+python sync_mysql.py --api-limit 10
 ```
 
-Das Prüfskript liest die Dateien am fest hinterlegten Nextcloud-Pfad, berechnet deren MD5 und speichert das Ergebnis getrennt in `file_md5`, `md5_matches` und `md5_checked_at`. Die Referenz in `md5` wird niemals verändert. Standardmäßig werden nur noch nicht geprüfte Dateien geprüft; mit `--all` wird der gesamte Bestand erneut geprüft, mit `--limit 1000` nur eine begrenzte Anzahl.
+Alle Posts erneut von der API abrufen:
+
+```bash
+python sync_mysql.py --refresh-api
 ```
 
-Optional:
+Optional kann ein anderer SQLite-Pfad angegeben werden:
 
 ```bash
 python sync_mysql.py --sqlite /pfad/e6ai_archive.sqlite3
 ```
 
-Der Lauf ist wiederholbar: bestehende Posts werden anhand ihrer e6AI-ID aktualisiert. `absolute_path` verweist auf den Nextcloud-Dateipfad; `file_exists` hält fest, ob die Datei beim Synchronisieren dort vorhanden war. Tag-Namen werden zusammen mit ihrer Kategorie als Schlüssel behandelt. Tag-Verknüpfungen und Favoriten werden beim Sync exakt an den SQLite-Stand angeglichen.
+Die MySQL-Zugangsdaten werden ausschließlich aus Umgebungsvariablen gelesen. Der Nextcloud-Stammpfad ist absichtlich fest im Skript hinterlegt und nicht konfigurierbar.
