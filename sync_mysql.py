@@ -213,7 +213,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
 
     # Rebuild relation tables from the authoritative SQLite snapshot. Posts are
     # upserted first so all foreign-key targets exist before relation inserts.
-    total = checked = mismatched = missing = 0
+    total = missing = 0
     post_cursor = src.execute("SELECT * FROM posts ORDER BY id")
     for chunk in batches(post_cursor):
         values = []
@@ -224,19 +224,12 @@ def sync(src: sqlite3.Connection, dst) -> None:
             post_id = int(post["id"])
             absolute_path, exists = resolve_file(post.get("local_path"))
             expected = normalized_md5(post.get("md5"))
+            # Import phase: never read/hash the file. The API-provided MD5 is
+            # retained as the immutable reference for a later integrity run.
             actual = None
             matches = None
             checked_at = None
-            if exists:
-                actual = calculate_md5(absolute_path)
-                checked_at = utc_now()
-                if expected:
-                    matches = int(actual == expected)
-                    checked += 1
-                    mismatched += int(not matches)
-                else:
-                    mismatched += 1
-            else:
+            if not exists:
                 missing += 1
 
             post_tags = tags_by_post.get(post_id, [])
@@ -249,9 +242,9 @@ def sync(src: sqlite3.Connection, dst) -> None:
                     "absolute_path": absolute_path,
                     "exists_at_sync": exists,
                     "api_md5": expected,
-                    "calculated_md5": actual,
-                    "md5_matches": matches,
-                    "md5_checked_at": checked_at,
+                    "calculated_md5": None,
+                    "md5_matches": None,
+                    "md5_checked_at": None,
                 },
             }
             values.append((
@@ -346,8 +339,9 @@ def sync(src: sqlite3.Connection, dst) -> None:
                 )
     dst.commit()
     LOG.info(
-        "Fertig: %s Posts; Dateien mit berechneter MD5: %s; MD5-Abweichungen/ohne Soll-MD5: %s; fehlende Dateien: %s",
-        total, checked, mismatched, missing,
+        "Fertig: %s Posts synchronisiert; fehlende Dateien am festen Nextcloud-Pfad: %s. "
+        "Es wurden keine Dateien geöffnet oder gehasht; die API-MD5 bleibt Referenz für spätere Prüfungen.",
+        total, missing,
     )
 
 
