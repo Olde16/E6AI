@@ -236,7 +236,7 @@ def sync(src: sqlite3.Connection, dst) -> None:
         for row in chunk:
             post = dict(row)
             post_id = int(post["id"])
-            absolute_path, exists = resolve_post_file(post.get("local_path"), post_id, file_index)
+            absolute_path, exists = resolve_post_file(post.get("local_path"), post_id, file_index, post.get("extension"))
             expected = normalized_md5(post.get("md5"))
             # Carry forward the verification already performed by the main
             # archive downloader. A verified file necessarily had this MD5;
@@ -409,7 +409,7 @@ def build_file_index(root: Path) -> dict[int, list[Path]]:
     return index
 
 
-def resolve_post_file(sqlite_path: Any, post_id: int, file_index: dict[int, list[Path]]) -> tuple[str | None, bool]:
+def resolve_post_file(sqlite_path: Any, post_id: int, file_index: dict[int, list[Path]], extension: Any = None) -> tuple[str | None, bool]:
     # An explicit SQLite path always wins, even if the file is currently absent.
     if sqlite_path:
         absolute, exists = resolve_file(sqlite_path)
@@ -417,8 +417,10 @@ def resolve_post_file(sqlite_path: Any, post_id: int, file_index: dict[int, list
     candidates = file_index.get(post_id, [])
     if not candidates:
         return None, False
-    # Prefer the conventional <id>.<ext> name, then the shortest stable path.
-    chosen = candidates[0].resolve()
+    # Prefer the exact <id>.<API-extension> filename where available.
+    preferred = f"{post_id}.{str(extension).lstrip('.')}" if extension else None
+    chosen_path = next((path for path in candidates if preferred and path.name == preferred), candidates[0])
+    chosen = chosen_path.resolve()
     return str(chosen), chosen.is_file()
 
 
