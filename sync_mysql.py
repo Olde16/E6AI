@@ -115,6 +115,37 @@ def create_schema(conn) -> None:
         ):
             if name not in columns:
                 cur.execute(f"ALTER TABLE posts ADD COLUMN {name} {definition}")
+        # Upgrade the old name-only tag key. These relation tables are rebuilt
+        # from SQLite during sync, so their old contents need not be preserved.
+        cur.execute("SHOW INDEX FROM tags")
+        indexes = cur.fetchall()
+        primary_columns = [
+            row["Column_name"] for row in sorted(
+                (item for item in indexes if item["Key_name"] == "PRIMARY"),
+                key=lambda item: item["Seq_in_index"],
+            )
+        ]
+        if primary_columns != ["name", "category"]:
+            cur.execute("DROP TABLE IF EXISTS post_tags")
+            cur.execute("DROP TABLE IF EXISTS tags")
+            cur.execute("""
+                CREATE TABLE tags (
+                    name VARCHAR(512) NOT NULL, category VARCHAR(64) NOT NULL,
+                    PRIMARY KEY (name, category), KEY idx_tags_category (category)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            cur.execute("""
+                CREATE TABLE post_tags (
+                    post_id BIGINT NOT NULL, tag_name VARCHAR(512) NOT NULL,
+                    category VARCHAR(64) NOT NULL DEFAULT '',
+                    PRIMARY KEY (post_id, tag_name, category),
+                    KEY idx_post_tags_tag (tag_name), KEY idx_post_tags_category (category),
+                    CONSTRAINT fk_post_tags_post FOREIGN KEY (post_id)
+                        REFERENCES posts(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_post_tags_tag FOREIGN KEY (tag_name, category)
+                        REFERENCES tags(name, category) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
     conn.commit()
 
 
