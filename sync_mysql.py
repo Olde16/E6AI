@@ -396,19 +396,15 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
             existing_ids = {int(item["id"]) for item in cur.fetchall()}
         new_chunk = [row for row in chunk if int(row["id"]) not in existing_ids]
         skipped_existing += len(chunk) - len(new_chunk)
-        if not new_chunk:
-            LOG.info(
-                "Posts geprüft: %s; bereits vorhanden übersprungen: %s",
-                total + skipped_existing, skipped_existing,
-            )
-            continue
-
-        new_ids = [int(row["id"]) for row in new_chunk]
-        sqlite_marks = ",".join("?" for _ in new_ids)
+        # Read relations for the whole batch, not only new posts. INSERT IGNORE
+        # repairs missing links from an interrupted earlier run without deleting
+        # existing links or API-only tags.
+        relation_ids = chunk_ids
+        sqlite_marks = ",".join("?" for _ in relation_ids)
         tags_by_post: dict[int, list[dict[str, str]]] = {}
         for tag_row in src.execute(
             f"SELECT post_id, tag_name, category FROM post_tags WHERE post_id IN ({sqlite_marks})",
-            new_ids,
+            relation_ids,
         ):
             tags_by_post.setdefault(int(tag_row["post_id"]), []).append({
                 "name": tag_row["tag_name"], "category": tag_row["category"] or ""
@@ -419,7 +415,7 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
             for fav_row in src.execute(
                 f"SELECT username, post_id, first_seen_at, last_seen_at, is_favorite "
                 f"FROM favorites WHERE post_id IN ({sqlite_marks})",
-                new_ids,
+                relation_ids,
             ):
                 favorites_by_post.setdefault(int(fav_row["post_id"]), []).append({
                     "username": fav_row["username"],
@@ -428,15 +424,24 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
                     "is_favorite": int(fav_row["is_favorite"]),
                 })
 
-        if file_index is None and any(not row["local_path"] for row in new_chunk):
+        tag_links = [
+            (post_id, tag["name"], tag["category"])
+            for post_id, post_tag_list in tags_by_post.items()
+            for tag in post_tag_list
+        ]
+        favorite_rows = [
+            (fav["username"], post_id, fav["first_seen_at"], fav["last_seen_at"], fav["is_favorite"])
+            for post_id, post_favorites in favorites_by_post.items()
+            for fav in post_favorites
+        ]
+
+        if new_chunk and file_index is None and any(not row["local_path"] for row in new_chunk):
             LOG.info("Erstelle Dateinamen-Index unter %s ...", IMAGE_ROOT)
             file_index = build_file_index(IMAGE_ROOT)
         if file_index is None:
             file_index = {}
 
         values = []
-        tag_links = []
-        favorite_rows = []
         for row in new_chunk:
             post = dict(row)
             post_id = int(post["id"])
@@ -476,13 +481,9 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
                 post.get("download_error"), post.get("scanned_at"),
                 json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str),
             ))
-            tag_links.extend((post_id, t["name"], t["category"]) for t in post_tags)
-            favorite_rows.extend((
-                f["username"], post_id, f["first_seen_at"], f["last_seen_at"], f["is_favorite"]
-            ) for f in post_favorites)
-
         with dst.cursor() as cur:
-            cur.executemany(
+            if values:
+                cur.executemany(
                 """
                 INSERT INTO posts (
                     id,created_at,updated_at,change_seq,rating,description,source,parent_id,
@@ -494,8 +495,8 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
                 )
                 ON DUPLICATE KEY UPDATE id=posts.id
                 """,
-                values,
-            )
+                    values,
+                )
             if tag_links:
                 cur.executemany(
                     "INSERT IGNORE INTO tags(name,category) VALUES (%s,%s)",
