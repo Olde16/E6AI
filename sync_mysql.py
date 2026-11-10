@@ -27,7 +27,7 @@ LOG = logging.getLogger("sync_mysql")
 DEFAULT_SQLITE = Path(__file__).resolve().parent / "archive" / "e6ai_archive.sqlite3"
 IMAGE_ROOT = Path("/var/www/nextcloud/data/__groupfolders/1/files/Furry/Artwork/Unsortiert/TWS_AI_DB")
 BATCH_SIZE = 500
-API_REQUEST_INTERVAL = 0.6
+API_REQUEST_INTERVAL = 0.5
 
 
 def utc_now() -> str:
