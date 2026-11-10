@@ -136,8 +136,7 @@ def create_schema(conn) -> None:
         ):
             if name not in columns:
                 cur.execute(f"ALTER TABLE posts ADD COLUMN {name} {definition}")
-        # Upgrade the old name-only tag key. These relation tables are rebuilt
-        # from SQLite during sync, so their old contents need not be preserved.
+        # Never discard existing tag or relation data during an automatic migration.
         cur.execute("SHOW INDEX FROM tags")
         indexes = cur.fetchall()
         primary_columns = [
@@ -484,17 +483,17 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
         with dst.cursor() as cur:
             if values:
                 cur.executemany(
-                """
-                INSERT INTO posts (
-                    id,created_at,updated_at,change_seq,rating,description,source,parent_id,
-                    has_children,is_deleted,width,height,extension,file_size,md5,file_md5,
-                    md5_matches,md5_checked_at,file_url,absolute_path,file_exists,downloaded,
-                    verification_status,download_error,scanned_at,post_data
-                ) VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                )
-                ON DUPLICATE KEY UPDATE id=posts.id
-                """,
+                    """
+                    INSERT INTO posts (
+                        id,created_at,updated_at,change_seq,rating,description,source,parent_id,
+                        has_children,is_deleted,width,height,extension,file_size,md5,file_md5,
+                        md5_matches,md5_checked_at,file_url,absolute_path,file_exists,downloaded,
+                        verification_status,download_error,scanned_at,post_data
+                    ) VALUES (
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                    )
+                    ON DUPLICATE KEY UPDATE id=posts.id
+                    """,
                     values,
                 )
             if tag_links:
