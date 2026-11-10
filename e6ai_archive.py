@@ -100,8 +100,8 @@ class AdaptiveRateLimiter:
     def success(self) -> None:
         with self.lock:
             self.success_streak += 1
-            if self.success_streak >= 20:
-                self.interval = max(self.min_interval, self.interval - 0.01)
+            if self.success_streak >= 5:
+                self.interval = max(self.min_interval, self.interval - 0.1)
                 self.success_streak = 0
                 self.throttle_count = 0
 
@@ -110,7 +110,7 @@ class AdaptiveRateLimiter:
         with self.lock:
             self.success_streak = 0
             self.throttle_count += 1
-            self.interval = min(10.0, max(self.interval * 1.5, self.min_interval))
+            self.interval = min(10.0, max(self.interval + 0.5, self.min_interval))
             if retry_after is not None:
                 pause = max(0.0, retry_after)
             elif status == 421:
