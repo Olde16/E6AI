@@ -189,29 +189,28 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
     src.row_factory = sqlite3.Row
     LOG.info("MySQL-Schema prüfen und ggf. ergänzen ...")
     create_schema(dst)
-    LOG.info("Synchronisiere ausschließlich neue Posts und fehlende Verknüpfungen ...")
 
-    # Existing MySQL rows, including API-enriched metadata, remain untouched.
-    # Relations are added with INSERT IGNORE; no existing rows are deleted.
+    # Read the complete MySQL post ID set once. Existing posts are skipped
+    # from this in-memory set; no per-batch existence query is needed.
+    LOG.info("Lese vorhandene MySQL-Post-IDs einmalig ein ...")
+    with dst.cursor() as cur:
+        cur.execute("SELECT id FROM posts")
+        existing_ids = {int(row["id"]) for row in cur.fetchall()}
+    LOG.info("%s vorhandene Posts in MySQL erkannt.", len(existing_ids))
+    LOG.info("Synchronisiere ausschließlich neue Posts und deren Verknüpfungen ...")
+
     total = skipped_existing = missing = 0
     file_index: dict[int, list[Path]] | None = None
     has_favorites = table_exists(src, "favorites")
     post_cursor = src.execute("SELECT * FROM posts ORDER BY id")
     for chunk in batches(post_cursor):
-        chunk_ids = [int(row["id"]) for row in chunk]
-        mysql_marks = ",".join("%s" for _ in chunk_ids)
-        with dst.cursor() as cur:
-            cur.execute(
-                f"SELECT id FROM posts WHERE id IN ({mysql_marks})",
-                chunk_ids,
-            )
-            existing_ids = {int(item["id"]) for item in cur.fetchall()}
         new_chunk = [row for row in chunk if int(row["id"]) not in existing_ids]
         skipped_existing += len(chunk) - len(new_chunk)
-        # Read relations for the whole batch, not only new posts. INSERT IGNORE
-        # repairs missing links from an interrupted earlier run without deleting
-        # existing links or API-only tags.
-        relation_ids = chunk_ids
+        if not new_chunk:
+            continue
+
+        # Only fetch SQLite relations for posts that are genuinely new.
+        relation_ids = [int(row["id"]) for row in new_chunk]
         sqlite_marks = ",".join("?" for _ in relation_ids)
         tags_by_post: dict[int, list[dict[str, str]]] = {}
         for tag_row in src.execute(
@@ -325,6 +324,7 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
                     favorite_rows,
                 )
         dst.commit()
+        existing_ids.update(relation_ids)
         total += len(new_chunk)
         LOG.info(
             "Neue Posts eingefügt: %s; bereits vorhanden übersprungen: %s",
@@ -337,8 +337,6 @@ def sync(src: sqlite3.Connection, dst, verbose: bool = False) -> None:
         "bestehende MySQL-Postdaten, API-Metadaten und Verknüpfungen wurden nicht gelöscht.",
         total, skipped_existing, missing,
     )
-
-
 
 def build_file_index(root: Path) -> dict[int, list[Path]]:
     """Index archive filenames once; never open or hash image contents."""
